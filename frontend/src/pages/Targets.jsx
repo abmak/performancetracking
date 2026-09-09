@@ -1,0 +1,315 @@
+import { useState, useEffect } from 'react';
+import { Plus, Edit2, Trash2, X, Check, Target } from 'lucide-react';
+import { targetsAPI, servicesAPI } from '../services/api';
+import { useAuth } from '../context/AuthContext';
+import { formatCurrency, formatPercent, getAchievementBg, getProgressBarColor } from '../utils/helpers';
+import { getDateFilter, setDateFilter } from '../utils/dateFilter';
+import toast from 'react-hot-toast';
+
+export default function Targets() {
+  const { hasPermission } = useAuth();
+  const canEdit = hasPermission('targets.edit');
+  const canDelete = hasPermission('targets.delete');
+  const canCreate = hasPermission('targets.create');
+  const [targets, setTargets] = useState([]);
+  const [services, setServices] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [showModal, setShowModal] = useState(false);
+  const [editingId, setEditingId] = useState(null);
+  // Date range filter — persisted across page navigation
+  const [filterStartDate, setFilterStartDate] = useState(() => getDateFilter('targets_start'));
+  const [filterEndDate, setFilterEndDate] = useState(() => getDateFilter('targets_end'));
+  const [form, setForm] = useState({
+    service_id: '', service_name: '', target_amount: '', period_type: 'monthly',
+    target_start_date: '2026-05-01', target_end_date: '2026-05-31',
+    fiscal_year: 2026, assigned_by: 'VAS Director', notes: '',
+  });
+
+  useEffect(() => { loadTargets(); loadServices(); }, [filterStartDate, filterEndDate]);
+
+  async function loadTargets() {
+    try {
+      const data = await targetsAPI.getAll({ start_date: filterStartDate, end_date: filterEndDate });
+      setTargets(data);
+    } catch (err) {
+      toast.error('Failed to load targets');
+    }
+    setLoading(false);
+  }
+
+  async function loadServices() {
+    try {
+      const data = await servicesAPI.getAll();
+      setServices(data.filter(s => s.status === 'active'));
+    } catch (err) { /* ignore */ }
+  }
+
+  function calculateEndDate(startDate, periodType) {
+    if (!startDate) return '';
+    const [y, m] = startDate.split('-').map(Number);
+    if (periodType === 'monthly') {
+      // Last day of the same month
+      const lastDay = new Date(y, m, 0).getDate();
+      return `${y}-${String(m).padStart(2, '0')}-${String(lastDay).padStart(2, '0')}`;
+    } else if (periodType === 'quarterly') {
+      // Last day of the quarter that contains the start month
+      const quarterMonth = Math.ceil(m / 3) * 3;
+      const lastDay = new Date(y, quarterMonth, 0).getDate();
+      return `${y}-${String(quarterMonth).padStart(2, '0')}-${String(lastDay).padStart(2, '0')}`;
+    } else if (periodType === 'yearly') {
+      // Exactly 12 months from start date
+      // If Jan start → end Dec 31 same year; otherwise end last day of (startMonth-1) next year
+      let endYear, endMonth;
+      if (m === 1) { endYear = y; endMonth = 12; }
+      else { endYear = y + 1; endMonth = m - 1; }
+      const lastDay = new Date(endYear, endMonth, 0).getDate();
+      return `${endYear}-${String(endMonth).padStart(2, '0')}-${String(lastDay).padStart(2, '0')}`;
+    }
+    return startDate;
+  }
+
+  function openCreate() {
+    setForm({
+      service_id: '', service_name: '', target_amount: '', period_type: 'monthly',
+      target_start_date: '2026-05-01', target_end_date: '2026-05-31',
+      fiscal_year: 2026, assigned_by: 'VAS Director', notes: '',
+    });
+    setEditingId(null);
+    setShowModal(true);
+  }
+
+  function openEdit(t) {
+    setForm({
+      service_id: t.service_id || '', service_name: t.service_name || '',
+      target_amount: t.target_amount, period_type: t.period_type,
+      target_start_date: t.target_start_date ? t.target_start_date.split('T')[0] : '',
+      target_end_date: t.target_end_date ? t.target_end_date.split('T')[0] : '',
+      fiscal_year: t.fiscal_year, assigned_by: t.assigned_by || '', notes: t.notes || '',
+    });
+    setEditingId(t.id);
+    setShowModal(true);
+  }
+
+  async function handleSubmit(e) {
+    e.preventDefault();
+    // Validate required fields
+    if (!form.service_id && !form.service_name) {
+      toast.error('Please select a service');
+      return;
+    }
+    if (!form.target_amount || parseFloat(form.target_amount) <= 0) {
+      toast.error('Please enter a valid target amount');
+      return;
+    }
+    if (!form.target_start_date) {
+      toast.error('Please select a start date');
+      return;
+    }
+    try {
+      const data = {
+        ...form,
+        target_amount: parseFloat(form.target_amount),
+        fiscal_year: parseInt(form.fiscal_year) || new Date().getFullYear(),
+      };
+      if (form.service_id) data.service_id = parseInt(form.service_id);
+
+      if (editingId) {
+        await targetsAPI.update(editingId, data);
+        toast.success('Target updated');
+      } else {
+        await targetsAPI.create(data);
+        toast.success('Target created');
+      }
+      setShowModal(false);
+      loadTargets();
+    } catch (err) {
+      toast.error(err.message);
+    }
+  }
+
+  async function handleDelete(id) {
+    if (!confirm('Delete this target?')) return;
+    try {
+      await targetsAPI.delete(id);
+      toast.success('Target deleted');
+      loadTargets();
+    } catch (err) {
+      toast.error(err.message);
+    }
+  }
+
+  const totalTarget = targets.reduce((s, t) => s + parseFloat(t.target_amount || 0), 0);
+
+  // Format date for display
+  function fmtDate(d) {
+    if (!d) return '-';
+    const date = new Date(d);
+    return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+  }
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center justify-between flex-wrap gap-4">
+        <div>
+          <h1 className="text-2xl font-bold text-gray-900">Revenue Targets</h1>
+          <p className="text-sm text-gray-500">Set and manage revenue targets per service</p>
+        </div>
+        {canCreate && (
+          <button onClick={openCreate} className="flex items-center gap-2 bg-blue-600 text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-blue-700">
+            <Plus size={16} /> Add Target
+          </button>
+        )}
+      </div>
+
+      {/* Date Range Filter */}
+      <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-4">
+        <div className="flex items-center gap-4 flex-wrap">
+          <label className="text-sm font-medium text-gray-600">Date Range:</label>
+          <div className="flex items-center gap-2">
+            <span className="text-xs text-gray-500">Start:</span>
+            <input type="date" value={filterStartDate} onChange={(e) => { setFilterStartDate(e.target.value); setDateFilter('targets_start', e.target.value); }}
+              className="border border-gray-300 rounded-lg px-3 py-2 text-sm" />
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="text-xs text-gray-500">End:</span>
+            <input type="date" value={filterEndDate} onChange={(e) => { setFilterEndDate(e.target.value); setDateFilter('targets_end', e.target.value); }}
+              className="border border-gray-300 rounded-lg px-3 py-2 text-sm" />
+          </div>
+          <div className="ml-auto text-sm text-gray-600">
+            Total Target: <span className="font-bold text-blue-600">{formatCurrency(totalTarget)}</span>
+            <span className="text-gray-400 mx-2">·</span>
+            <span>{targets.length} targets</span>
+          </div>
+        </div>
+      </div>
+
+      {/* Targets Table */}
+      {loading ? (
+        <div className="text-center py-12 text-gray-500">Loading...</div>
+      ) : (
+        <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead className="bg-gray-50">
+                <tr>
+                  <th className="text-left py-3 px-4 font-semibold text-gray-600">Service</th>
+                  <th className="text-center py-3 px-4 font-semibold text-gray-600">Period</th>
+                  <th className="text-center py-3 px-4 font-semibold text-gray-600">Start Date</th>
+                  <th className="text-center py-3 px-4 font-semibold text-gray-600">End Date</th>
+                  <th className="text-right py-3 px-4 font-semibold text-gray-600">Target Amount</th>
+                  <th className="text-center py-3 px-4 font-semibold text-gray-600">Assigned By</th>
+                  <th className="text-center py-3 px-4 font-semibold text-gray-600">Notes</th>
+                  <th className="text-center py-3 px-4 font-semibold text-gray-600">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {targets.map((t) => (
+                  <tr key={t.id} className="border-t border-gray-50 hover:bg-gray-50">
+                    <td className="py-3 px-4">
+                      <div className="font-medium text-gray-900">{t.service_name}</div>
+                    </td>
+                    <td className="text-center py-3 px-4">
+                      <span className="px-2 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-700 capitalize">
+                        {t.period_type}
+                      </span>
+                    </td>
+                    <td className="text-center py-3 px-4 text-gray-600">{fmtDate(t.target_start_date)}</td>
+                    <td className="text-center py-3 px-4 text-gray-600">{fmtDate(t.target_end_date)}</td>
+                    <td className="text-right py-3 px-4 font-semibold text-gray-900">{formatCurrency(t.target_amount)}</td>
+                    <td className="text-center py-3 px-4 text-gray-600">{t.assigned_by}</td>
+                    <td className="text-center py-3 px-4 text-gray-500 text-xs max-w-[200px] truncate">{t.notes}</td>
+                    <td className="text-center py-3 px-4">
+                      <div className="flex items-center justify-center gap-1">
+                        {canEdit && <button onClick={() => openEdit(t)} className="p-1.5 rounded hover:bg-gray-100 text-gray-400 hover:text-blue-600"><Edit2 size={14} /></button>}
+                        {canDelete && <button onClick={() => handleDelete(t.id)} className="p-1.5 rounded hover:bg-gray-100 text-gray-400 hover:text-red-600"><Trash2 size={14} /></button>}
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+                {targets.length === 0 && (
+                  <tr><td colSpan={8} className="text-center py-12 text-gray-400">No targets found for this date range</td></tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* Modal */}
+      {showModal && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <div className="bg-white rounded-xl shadow-xl w-full max-w-lg mx-4 p-6">
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-lg font-semibold">{editingId ? 'Edit Target' : 'Add New Target'}</h2>
+              <button onClick={() => setShowModal(false)} className="p-1 hover:bg-gray-100 rounded"><X size={18} /></button>
+            </div>
+            <form onSubmit={handleSubmit} className="space-y-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Service *</label>
+                <select required value={form.service_id || form.service_name} onChange={(e) => {
+                  const val = e.target.value;
+                  const svc = services.find(s => s.id.toString() === val);
+                  if (svc) {
+                    setForm({ ...form, service_id: val, service_name: svc.name });
+                  } else {
+                    setForm({ ...form, service_id: '', service_name: val });
+                  }
+                }} className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm">
+                  <option value="">Select a service</option>
+                  {services.map(s => <option key={s.id} value={s.id}>{s.name} ({s.code})</option>)}
+                </select>
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Target Amount (ETB) *</label>
+                <input required type="number" min="0" step="0.01" value={form.target_amount} onChange={(e) => setForm({ ...form, target_amount: e.target.value })} className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm" placeholder="e.g., 2500000" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Period Type *</label>
+                <select value={form.period_type} onChange={(e) => {
+                  const newType = e.target.value;
+                  const newEnd = form.target_start_date ? calculateEndDate(form.target_start_date, newType) : form.target_end_date;
+                  setForm({ ...form, period_type: newType, target_end_date: newEnd });
+                }} className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm">
+                  <option value="monthly">Monthly</option>
+                  <option value="quarterly">Quarterly</option>
+                  <option value="yearly">Yearly</option>
+                </select>
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Target Start Date *</label>
+                  <input required type="date" value={form.target_start_date} onChange={(e) => {
+                    const startDate = e.target.value;
+                    const endDate = calculateEndDate(startDate, form.period_type);
+                    setForm({ ...form, target_start_date: startDate, target_end_date: endDate });
+                  }} className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm" />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Target End Date *</label>
+                  <input required type="date" value={form.target_end_date} onChange={(e) => setForm({ ...form, target_end_date: e.target.value })}
+                    className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm" />                    <p className="text-xs text-gray-400 mt-1">
+                    Auto-calculated: {form.period_type === 'monthly' ? 'End of month' : form.period_type === 'quarterly' ? 'End of quarter' : 'Same date next year (minus 1 day)'}
+                  </p>
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Assigned By</label>
+                  <input value={form.assigned_by} onChange={(e) => setForm({ ...form, assigned_by: e.target.value })} className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm" />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Notes</label>
+                  <input value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm" placeholder="Optional notes" />
+                </div>
+              </div>
+              <div className="flex justify-end gap-3 pt-2">
+                <button type="button" onClick={() => setShowModal(false)} className="px-4 py-2 text-sm text-gray-700 bg-gray-100 rounded-lg hover:bg-gray-200">Cancel</button>
+                <button type="submit" className="px-4 py-2 text-sm text-white bg-blue-600 rounded-lg hover:bg-blue-700 flex items-center gap-1"><Check size={14} /> {editingId ? 'Update' : 'Create'}</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
