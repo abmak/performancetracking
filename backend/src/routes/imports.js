@@ -5,6 +5,7 @@ const XLSX = require('xlsx');
 const { v4: uuidv4 } = require('uuid');
 const { requirePermission } = require('../middleware/permissions');
 const pool = require('../config/database');
+const { invalidate } = require('../utils/endpointCache');
 
 // Configure multer for file upload
 const storage = multer.memoryStorage();
@@ -415,8 +416,8 @@ router.post('/revenue', requirePermission('import.upload'), upload.single('file'
         }
 
         await pool.execute(
-          'INSERT INTO actual_revenue (service_id, amount, revenue_date, source, import_batch_id, entered_by, notes) VALUES (?, ?, ?, ?, ?, ?, ?)',
-          [serviceId, amount, revenueDate, 'excel_import', batchId, req.body.imported_by || 'System', notes]
+          'INSERT INTO actual_revenue (service_id, amount, revenue_date, revenue_month, source, import_batch_id, entered_by, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+          [serviceId, amount, revenueDate, revenueDate.substring(0, 7), 'excel_import', batchId, req.body.imported_by || 'System', notes]
         );
         successful++;
       } catch (rowError) {
@@ -436,6 +437,15 @@ router.post('/revenue', requirePermission('import.upload'), upload.single('file'
       'INSERT INTO audit_trail (action, entity_type, description, user_name) VALUES (?, ?, ?, ?)',
       ['import', 'revenue', `Imported ${successful} revenue records from ${req.file.originalname}`, req.body.imported_by || 'System']
     );
+
+    // Invalidate partner caches so month dropdown and data refresh
+    if (successful > 0) {
+      invalidate('/partners/months');
+      invalidate('/partners');
+      invalidate('/partners/summary');
+      invalidate('/partners/top-partners');
+      invalidate('/dashboard');
+    }
 
     res.json({
       batch_id: batchId,
@@ -504,8 +514,8 @@ router.post('/confirm', requirePermission('import.upload'), async (req, res) => 
           );
         } catch (e) {
           await pool.execute(
-            'INSERT INTO actual_revenue (service_id, amount, revenue_date, source, import_batch_id, entered_by, notes) VALUES (?, ?, ?, ?, ?, ?, ?)',
-            [service_id, amount, revDate, 'excel_import', batchId, imported_by || 'System', notes || '']
+            'INSERT INTO actual_revenue (service_id, amount, revenue_date, revenue_month, source, import_batch_id, entered_by, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            [service_id, amount, revDate, effectiveMonth || revDate.substring(0, 7), 'excel_import', batchId, imported_by || 'System', notes || '']
           );
         }
         successful++;
@@ -526,6 +536,15 @@ router.post('/confirm', requirePermission('import.upload'), async (req, res) => 
       'INSERT INTO audit_trail (action, entity_type, description, user_name) VALUES (?, ?, ?, ?)',
       ['import', 'revenue', `Confirmed import of ${successful} revenue records from ${filename}`, imported_by || 'System']
     );
+
+    // Invalidate partner caches so month dropdown and data refresh
+    if (successful > 0) {
+      invalidate('/partners/months');
+      invalidate('/partners');
+      invalidate('/partners/summary');
+      invalidate('/partners/top-partners');
+      invalidate('/dashboard');
+    }
 
     res.json({
       batch_id: batchId,
@@ -573,9 +592,16 @@ router.delete('/:id', async (req, res) => {
 
     // Delete revenue data linked to this import batch
     await pool.execute('DELETE FROM partner_revenue WHERE import_batch_id = ?', [req.params.id]);
+    await pool.execute('DELETE FROM actual_revenue WHERE import_batch_id = ?', [req.params.id]);
 
     // Delete the import batch record
     await pool.execute('DELETE FROM import_batches WHERE id = ?', [req.params.id]);
+
+    // Invalidate partner caches
+    invalidate('/partners/months');
+    invalidate('/partners');
+    invalidate('/partners/summary');
+    invalidate('/partners/top-partners');
 
     res.json({ message: 'Import batch and associated revenue data deleted' });
   } catch (error) {

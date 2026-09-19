@@ -6,7 +6,10 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
-    "db:setup": "node src/config/dbSetup.js"
+    "db:setup": "node src/config/dbSetup.js",
+    "db:admin-perms": "node src/config/ensureAdminPermissions.js",
+    "db:chat-perms": "node src/config/addChatPermissions.js",
+    "db:multi-section-scope": "node src/config/addMultiSectionScope.js"
   },
   "dependencies": {
     "@google/generative-ai": "^0.24.1",

@@ -158,7 +158,7 @@ router.get('/', async (req, res) => {
       enriched.push({
         ...row,
         assignee_ids: assigneeIds,
-        can_change_status: req.user && (req.user.id === row.created_by_id || assigneeIds.includes(req.user.id) || (req.user.role_name === 'Admin')),
+        can_change_status: req.user && (req.user.id === row.created_by_id || assigneeIds.includes(req.user.id) || req.user.role_scope === 'GLOBAL'),
         valid_transitions: VALID_TRANSITIONS[row.status] || [],
         revenue_change: await computeRevenueChange(row),
       });
@@ -198,7 +198,7 @@ router.get('/:id', async (req, res) => {
     res.json({
       ...action,
       assignee_ids: assigneeIds,
-      can_change_status: req.user && (req.user.id === action.created_by_id || assigneeIds.includes(req.user.id) || (req.user.role_name === 'Admin')),
+      can_change_status: req.user && (req.user.id === action.created_by_id || assigneeIds.includes(req.user.id) || req.user.role_scope === 'GLOBAL'),
       valid_transitions: VALID_TRANSITIONS[action.status] || [],
       history,
       revenue_change: await computeRevenueChange(action),
@@ -275,7 +275,7 @@ router.post('/:id/transition', async (req, res) => {
 
     // Only creator, assignees or admins may change status
     const assigneeIds = await getAssigneeIds(req.params.id);
-    const canChange = req.user && (req.user.id === action.created_by_id || assigneeIds.includes(req.user.id) || req.user.role_name === 'Admin');
+    const canChange = req.user && (req.user.id === action.created_by_id || assigneeIds.includes(req.user.id) || req.user.role_scope === 'GLOBAL');
     if (!canChange) {
       return res.status(403).json({ error: 'Only the assigned user or the action creator can change the status' });
     }

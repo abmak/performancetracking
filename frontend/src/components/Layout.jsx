@@ -30,7 +30,7 @@ import {
   Layers,
 } from 'lucide-react';
 
-const navItems = [
+const vasNavItems = [
   { to: '/dashboard', icon: LayoutDashboard, label: 'Dashboard', permission: 'dashboard.view' },
   { to: '/partners', icon: Users, label: 'Partner Revenue', permission: 'partners.view' },
   { to: '/services', icon: Building2, label: 'VAS Services', permission: 'services.view' },
@@ -51,6 +51,26 @@ const navItems = [
   { to: '/audit', icon: ClipboardList, label: 'Audit Trail', permission: 'audit.view' },
 ];
 
+const channelNavItems = [
+  { to: '/channel', icon: LayoutDashboard, label: 'Channel Dashboard', permission: 'channel_dashboard.view' },
+  { to: '/channel/import-batch', icon: Upload, label: 'Batch Import', permission: 'channel_import.batch' },
+  { to: '/channel/import-single', icon: Users, label: 'Single Registration', permission: 'channel_import.single' },
+  { to: '/channel/reports', icon: FileBarChart, label: 'Channel Reports', permission: 'channel_reports.view' },
+  { to: '/messages', icon: MessageSquare, label: 'Messages', permission: 'channel_messages.view' },
+  { to: '/chat', icon: MessageCircle, label: 'Chat', permission: 'channel_chat.view' },
+  { to: '/users', icon: UserCog, label: 'Users', permission: 'channel_users.view' },
+  { to: '/roles', icon: Shield, label: 'Roles', permission: 'channel_roles.view' },
+  { to: '/audit', icon: ClipboardList, label: 'Audit Trail', permission: 'channel_audit.view' },
+];
+
+// The master admin runs population administration, role/permission management and
+// the audit trail, so their sidebar deliberately exposes no other module.
+const superAdminNavItems = [
+  { to: '/admin/users', icon: UserCog, label: 'User Management', permission: 'users.view' },
+  { to: '/roles', icon: Shield, label: 'Roles & Permissions', permission: 'roles.view' },
+  { to: '/audit', icon: ClipboardList, label: 'Audit Trail', permission: 'audit.view' },
+];
+
 export default function Layout() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [userMenuOpen, setUserMenuOpen] = useState(false);
@@ -60,10 +80,45 @@ export default function Layout() {
   const [notifOpen, setNotifOpen] = useState(false);
   const [notifications, setNotifications] = useState([]);
   const [notifUnread, setNotifUnread] = useState(0);
-  const { user, logout, hasPermission, updateUser, changePassword, uploadAvatar, removeAvatar } = useAuth();
+  const { user, isMasterAdmin, logout, hasPermission, updateUser, changePassword, uploadAvatar, removeAvatar, swapSection } = useAuth();
   const location = useLocation();
   const navigate = useNavigate();
   const isChatPage = location.pathname === '/chat';
+  // Only offer the sections this account is actually allowed to enter
+  const canEnter = (section) =>
+    !Array.isArray(user?.available_sections) || user.available_sections.includes(section);
+  const [sectionMenuOpen, setSectionMenuOpen] = useState(false);
+  const [swapping, setSwapping] = useState(false);
+
+  // Determine nav items:
+  // - Master admin with no section selected → admin console
+  // - Master admin who swapped into a section → that section's nav
+  // - Regular user → their section's nav
+  const isIC = user?.section === 'INDIRECT_CHANNEL';
+  const isGlobalAdmin = isMasterAdmin && user?.section === null;
+  const navItems = isGlobalAdmin ? superAdminNavItems : (isIC ? channelNavItems : vasNavItems);
+
+  async function handleSectionSwap(targetSection) {
+    setSwapping(true);
+    try {
+      await swapSection(targetSection);
+      setSectionMenuOpen(false);
+      if (targetSection === null) {
+        toast.success('Switched to Administration view');
+        navigate('/admin/users');
+      } else {
+        toast.success('Switched to ' + (targetSection === 'VAS' ? 'VAS' : 'Indirect Channel') + ' section');
+        if (targetSection === 'INDIRECT_CHANNEL') {
+          navigate('/channel');
+        } else {
+          navigate('/dashboard');
+        }
+      }
+    } catch (err) {
+      toast.error('Failed to switch section: ' + err.message);
+    }
+    setSwapping(false);
+  }
 
   // Poll unread messages every 10 seconds
   useEffect(() => {
@@ -135,7 +190,7 @@ export default function Layout() {
     <div className="flex h-screen overflow-hidden">
       {/* Sidebar */}
       <aside
-        className={`bg-white text-gray-700 flex flex-col transition-all duration-300 border-r border-gray-200 shadow-sm ${
+        className={`bg-gradient-to-b from-white via-white to-slate-50 text-gray-700 flex flex-col transition-all duration-300 border-r border-gray-200 shadow-sm ${
           sidebarOpen ? 'w-64' : 'w-16'
         }`}
       >
@@ -146,23 +201,27 @@ export default function Layout() {
               <div className="vas-logo">
                 <div className="vas-logo-inner">
                   <span className="vas-logo-text">
-                    <span className="vas-letter">V</span>
-                    <span className="vas-letter">A</span>
-                    <span className="vas-letter">S</span>
+                    {isIC ? (
+                      <><span className="vas-letter">I</span><span className="vas-letter">D</span><span className="vas-letter">C</span></>
+                    ) : isGlobalAdmin ? (
+                      <><span className="vas-letter">A</span><span className="vas-letter">D</span><span className="vas-letter">M</span></>
+                    ) : (
+                      <><span className="vas-letter">V</span><span className="vas-letter">A</span><span className="vas-letter">S</span></>
+                    )}
                   </span>
                   <span className="vas-cursor"></span>
                 </div>
               </div>
               <div className="flex flex-col">
-                <span className="text-[11px] font-bold tracking-[0.2em] uppercase text-gray-800">Performance</span>
-                <span className="text-[9px] font-medium tracking-[0.15em] uppercase text-gray-400">Real-Time Monitoring</span>
+                <span className="text-[11px] font-bold tracking-[0.2em] uppercase text-gray-800">{isIC ? 'Performance' : isGlobalAdmin ? 'Administration' : 'Performance'}</span>
+                <span className="text-[9px] font-medium tracking-[0.15em] uppercase text-gray-400">{isIC ? 'Real-Time Monitoring' : isGlobalAdmin ? 'Control Panel' : 'Real-Time Monitoring'}</span>
               </div>
             </div>
           ) : (
             <div className="vas-logo mx-auto">
               <div className="vas-logo-inner">
                 <span className="vas-logo-text">
-                  <span className="vas-letter">V</span>
+                  <span className="vas-letter">{isIC ? 'I' : isGlobalAdmin ? 'A' : 'V'}</span>
                 </span>
               </div>
             </div>
@@ -176,19 +235,19 @@ export default function Layout() {
         </div>
 
         {/* Navigation */}
-        <nav className="flex-1 py-4 overflow-y-auto">
+        <nav className="flex-1 px-2 py-4 space-y-1 overflow-y-auto">
           {navItems.filter(item => !item.permission || hasPermission(item.permission)).map((item) => (
             <NavLink
               key={item.to}
               to={item.to}
               end={item.to === '/dashboard'}
               className={({ isActive }) =>
-                `relative flex items-center gap-3 px-4 py-3 text-sm transition-colors ${
+                `relative flex items-center gap-3 px-3 py-2.5 text-sm font-medium rounded-xl transition-all duration-200 ${
                   isActive
-                    ? 'bg-green-500 text-white border-r-4 border-green-300 shadow-sm'
+                    ? 'bg-gradient-to-r from-emerald-500 to-green-600 text-white shadow-md shadow-emerald-500/25'
                     : item.highlight
-                      ? 'text-gray-600 hover:bg-green-50 hover:text-green-700 bg-gradient-to-r from-green-50 to-emerald-50 border-l-2 border-green-400'
-                      : 'text-gray-600 hover:bg-green-50 hover:text-green-700'
+                      ? 'text-emerald-700 bg-gradient-to-r from-emerald-50 to-teal-50 ring-1 ring-emerald-100 hover:ring-emerald-200'
+                      : 'text-gray-600 hover:bg-gray-100/80 hover:text-gray-900'
                 }`
               }
             >
@@ -221,7 +280,7 @@ export default function Layout() {
               {user?.avatar_url ? (
                 <img src={user.avatar_url} alt="Avatar" className="w-8 h-8 rounded-full object-cover border border-gray-200" />
               ) : (
-                <div className="w-8 h-8 bg-green-500 rounded-full flex items-center justify-center text-sm font-semibold text-white">
+                <div className="w-8 h-8 rounded-full bg-gradient-to-br from-emerald-500 to-green-600 flex items-center justify-center text-sm font-semibold text-white shadow-sm ring-2 ring-white">
                   {userInitial}
                 </div>
               )}
@@ -257,13 +316,59 @@ export default function Layout() {
       {/* Main Content */}
       <div className="flex-1 flex flex-col overflow-hidden">
         {/* Top bar */}
-        <header className="h-16 bg-white border-b border-gray-200 flex items-center px-6 justify-between">
+        <header className="h-16 bg-white/80 backdrop-blur border-b border-gray-200 flex items-center px-6 justify-between shadow-sm">
           <div className="flex items-center gap-2 text-sm text-gray-500">              <div className="flex items-center gap-2">
               <img src="/ethio-telecom-logo.png" alt="Ethio Telecom" className="h-10" />
               <div className="w-px h-5 bg-gray-300"></div>
               <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse"></div>
-              <span className="text-sm font-semibold tracking-wide text-gray-800">VAS Performance Tracker</span>
+              <span className="text-sm font-semibold tracking-wide text-gray-800">{isGlobalAdmin ? 'User Administration' : isIC ? 'Indirect Channel' : 'VAS Performance Tracker'}</span>
               <span className="text-[10px] font-medium text-green-600 bg-green-50 px-2 py-0.5 rounded-full border border-green-200">LIVE</span>
+              {(user?.section === null || hasPermission('sections.swap') || isMasterAdmin) && (
+                <>
+                  <div className="w-px h-5 bg-gray-300" />
+                  <div className="relative">
+                    <button onClick={() => setSectionMenuOpen(!sectionMenuOpen)}
+                      className="flex items-center gap-1 px-2 py-1 bg-blue-50 border border-blue-200 rounded-lg text-xs font-medium text-blue-700 hover:bg-blue-100 transition">
+                      {user?.section === null ? (isMasterAdmin ? 'Administration' : 'All Sections') : user?.section === 'INDIRECT_CHANNEL' ? 'Channel' : 'VAS'}
+                      <ChevronDown size={12} />
+                    </button>
+                    {sectionMenuOpen && (
+                      <>
+                        <div className="fixed inset-0 z-10" onClick={() => setSectionMenuOpen(false)} />
+                        <div className="absolute left-0 mt-2 w-48 bg-white rounded-lg shadow-lg border border-gray-200 z-20">
+                          <div className="p-2">
+                            <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider px-2 py-1">Switch Section</p>
+                            {isMasterAdmin && (
+                              <button onClick={() => handleSectionSwap(null)} disabled={swapping}
+                                className="w-full flex items-center gap-2 px-3 py-2 text-sm rounded-md transition hover:bg-gray-50 disabled:opacity-50">
+                                <Shield size={14} className="text-purple-500" />
+                                Administration
+                                {user?.section === null && <span className="ml-auto text-xs text-purple-600 font-medium">Current</span>}
+                              </button>
+                            )}
+                            {canEnter('VAS') && (
+                              <button onClick={() => handleSectionSwap('VAS')} disabled={swapping}
+                                className="w-full flex items-center gap-2 px-3 py-2 text-sm rounded-md transition hover:bg-gray-50 disabled:opacity-50">
+                                <div className="w-2 h-2 rounded-full bg-green-500" />
+                                VAS Section
+                                {user?.section === 'VAS' && <span className="ml-auto text-xs text-green-600 font-medium">Current</span>}
+                              </button>
+                            )}
+                            {canEnter('INDIRECT_CHANNEL') && (
+                              <button onClick={() => handleSectionSwap('INDIRECT_CHANNEL')} disabled={swapping}
+                                className="w-full flex items-center gap-2 px-3 py-2 text-sm rounded-md transition hover:bg-gray-50 disabled:opacity-50">
+                                <div className="w-2 h-2 rounded-full bg-blue-500" />
+                                Indirect Channel
+                                {user?.section === 'INDIRECT_CHANNEL' && <span className="ml-auto text-xs text-blue-600 font-medium">Current</span>}
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      </>
+                    )}
+                  </div>
+                </>
+              )}
             </div>
           </div>
           <div className="flex items-center gap-4">

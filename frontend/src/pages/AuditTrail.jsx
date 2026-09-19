@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { ClipboardList, Filter } from 'lucide-react';
 import { auditAPI } from '../services/api';
 import { formatDate } from '../utils/helpers';
+import { useAuth } from '../context/AuthContext';
 
 const ACTION_COLORS = {
   create: 'bg-green-100 text-green-700',
@@ -17,9 +18,14 @@ const ENTITY_COLORS = {
 };
 
 export default function AuditTrail() {
+  const { user } = useAuth();
   const [logs, setLogs] = useState({ data: [], pagination: {} });
   const [loading, setLoading] = useState(true);
   const [filters, setFilters] = useState({ entity_type: '', action: '', page: 1 });
+
+  // When section is null (admin mode / cross-section), no filter is sent
+  // and the backend returns all entries. Otherwise scope to the user's section.
+  const sectionFilter = user?.section || undefined;
 
   useEffect(() => { loadLogs(); }, [filters]);
 
@@ -28,6 +34,7 @@ export default function AuditTrail() {
     try {
       const params = {};
       Object.entries(filters).forEach(([k, v]) => { if (v) params[k] = v; });
+      if (sectionFilter) params.section = sectionFilter;
       setLogs(await auditAPI.getAll(params));
     } catch (err) { console.error(err); }
     setLoading(false);

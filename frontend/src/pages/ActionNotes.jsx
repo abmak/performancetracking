@@ -690,7 +690,7 @@ function TaskPanel({ action, onUpdate }) {
       user.id === task.assigned_to ||
       user.id === task.assigned_by_id ||
       user.id === action.created_by_id ||
-      user.role_name === 'Admin'
+      user.role_scope === 'GLOBAL'
     );
   };
 

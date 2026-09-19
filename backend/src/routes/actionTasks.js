@@ -172,7 +172,7 @@ router.patch('/:id/status', async (req, res) => {
       allowed = req.user && (
         req.user.id === task.assigned_by_id ||
         req.user.id === task.action_creator_id ||
-        req.user.role_name === 'Admin'
+        req.user.role_scope === 'GLOBAL'
       );
     }
     if (!allowed) {

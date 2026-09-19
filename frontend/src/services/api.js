@@ -143,6 +143,10 @@ export const partnersAPI = {
     const qs = new URLSearchParams(params).toString();
     return request(`/partners/partners?${qs}`);
   },
+  getRecords: (params) => {
+    const qs = new URLSearchParams(params).toString();
+    return request(`/partners/records?${qs}`);
+  },
   getDashboardKPIs: (params) => {
     const qs = new URLSearchParams(params).toString();
     return request(`/partners/dashboard-kpis?${qs}`);
@@ -154,11 +158,16 @@ export const partnersAPI = {
 
 // Roles
 export const rolesAPI = {
-  getAll: () => request('/roles'),
+  getAll: (params) => {
+    const qs = params ? new URLSearchParams(params).toString() : '';
+    return request(`/roles${qs ? `?${qs}` : ''}`);
+  },
   getOne: (id) => request(`/roles/${id}`),
   create: (data) => request('/roles', { method: 'POST', body: data }),
   update: (id, data) => request(`/roles/${id}`, { method: 'PUT', body: data }),
   delete: (id) => request(`/roles/${id}`, { method: 'DELETE' }),
+  getSectionAccess: (id) => request(`/roles/${id}/section-access`),
+  setSectionAccess: (id, sections) => request(`/roles/${id}/section-access`, { method: 'PUT', body: { sections } }),
 };
 
 // Permissions
@@ -178,6 +187,12 @@ export const usersAPI = {
   create: (data) => request('/users', { method: 'POST', body: data }),
   update: (id, data) => request(`/users/${id}`, { method: 'PUT', body: data }),
   delete: (id) => request(`/users/${id}`, { method: 'DELETE' }),
+  // Section-specific role assignments
+  getSections: (id) => request(`/users/${id}/sections`),
+  setSection: (id, data) => request(`/users/${id}/sections`, { method: 'POST', body: data }),
+  removeSection: (id, section) => request(`/users/${id}/sections/${section}`, { method: 'DELETE' }),
+  // Every per-section assignment at once (super admin view)
+  getAllSectionAssignments: () => request('/users/section-assignments'),
 };
 
 // Action Notes (revenue enhancement tracking)
@@ -276,6 +291,7 @@ export const exportsAPI = {
 
 // Chat
 export const chatAPI = {
+  getContacts: () => request('/chat/contacts'),
   getConversations: (userId) => request(`/chat/conversations?user_id=${userId}`),
   getMessages: (userId, otherUserId) => request(`/chat/messages?user_id=${userId}&other_user_id=${otherUserId}`),
   sendMessage: (data) => request('/chat/send', { method: 'POST', body: data }),
@@ -290,6 +306,11 @@ export const chatAPI = {
   getGroupMessages: (groupId) => request(`/chat/groups/${groupId}/messages`),
   sendGroupMessage: (groupId, data) => request(`/chat/groups/${groupId}/messages`, { method: 'POST', body: data }),
   getUnread: (userId) => request(`/chat/unread/${userId}`),
+  sendTyping: (data) => request('/chat/typing', { method: 'POST', body: data }),
+  getTyping: (params) => {
+    const qs = new URLSearchParams(params).toString();
+    return request(`/chat/typing?${qs}`);
+  },
   deleteMessage: (messageId, senderId) => request(`/chat/messages/${messageId}?sender_id=${senderId}`, { method: 'DELETE' }),
   uploadMedia: async (formData) => {
     const url = `${API_BASE}/chat/upload`;
@@ -319,4 +340,108 @@ export const aiUsageAPI = {
     return request(`/ai/usage-report?${qs}`);
   },
   getApiKeys: () => request('/ai/api-keys'),
+};
+
+// Auth — section swap (admin only)
+export const authSwapAPI = {
+  swapSection: (targetSection) => request('/auth/swap-section', {
+    method: 'POST',
+    body: { target_section: targetSection },
+  }),
+};
+
+// Indirect Channel — dashboard, entities, imports
+export const channelAPI = {
+  getMeta: () => request('/channel/meta'),
+  getKPIs: (params) => {
+    const qs = new URLSearchParams(params || {}).toString();
+    return request(`/channel/dashboard/kpis?${qs}`);
+  },
+  getMatrix: (params) => {
+    const qs = new URLSearchParams(params || {}).toString();
+    return request(`/channel/dashboard/matrix?${qs}`);
+  },
+  getTrend: (params) => {
+    const qs = new URLSearchParams(params || {}).toString();
+    return request(`/channel/dashboard/trend?${qs}`);
+  },
+  getTopDistributors: (params) => {
+    const qs = new URLSearchParams(params || {}).toString();
+    return request(`/channel/dashboard/top-distributors?${qs}`);
+  },
+  getGeo: (params) => {
+    const qs = new URLSearchParams(params || {}).toString();
+    return request(`/channel/dashboard/geo?${qs}`);
+  },
+  getEntities: (params) => {
+    const qs = new URLSearchParams(params || {}).toString();
+    return request(`/channel/entities?${qs}`);
+  },
+  getEntity: (id) => request(`/channel/entities/${id}`),
+  lookupEntity: (mobile) => request(`/channel/entities/lookup?mobile=${encodeURIComponent(mobile)}`),
+  verifyTin: (tin) => request(`/channel/tin-verify/${encodeURIComponent(tin)}`),
+  verifyEntityTin: (id, data) => request(`/channel/entities/${id}/verify-tin`, { method: 'POST', body: data }),
+  batchVerifyTins: (data) => request('/channel/tin-verify/batch', { method: 'POST', body: data }),
+  // Closed lists for the registration form's upline pickers (level 1 or 2),
+  // each entry carrying enough profile to fill the form in from the selection.
+  getEntityOptions: (params) => {
+    const qs = new URLSearchParams(params || {}).toString();
+    return request(`/channel/entities/select-options${qs ? `?${qs}` : ''}`);
+  },
+  // Per-level report: Distributor (1), Sub-Distributor (2), Retailer (3).
+  getLevelReport: (params) => {
+    const qs = new URLSearchParams(params || {}).toString();
+    return request(`/channel/reports/level?${qs}`);
+  },
+  // Retailer coverage: retailers by area, the areas still without one, and how
+  // many uplines hold a retailer.
+  getRetailerCoverage: (params) => {
+    const qs = new URLSearchParams(params || {}).toString();
+    return request(`/channel/reports/retailer-coverage?${qs}`);
+  },
+  // Correct what a Sub-Distributor or Retailer holds right now, from the report
+  // list, without re-importing a workbook.
+  setStockBalance: (id, data) => request(`/channel/entities/${id}/stock-balance`, { method: 'PUT', body: data }),
+  createEntity: (data) => request('/channel/entities', { method: 'POST', body: data }),
+  updateEntity: (id, data) => request(`/channel/entities/${id}`, { method: 'PUT', body: data }),
+  deleteEntity: (id, force) => request(`/channel/entities/${id}${force ? '?force=1' : ''}`, { method: 'DELETE' }),
+  previewImport: async (formData) => {
+    const url = `${API_BASE}/channel/imports/preview`;
+    const token = localStorage.getItem('vas_token');
+    const response = await fetch(url, { method: 'POST', body: formData, headers: token ? { Authorization: `Bearer ${token}` } : {} });
+    if (!response.ok) {
+      let message = 'Import preview failed';
+      try { const data = await response.json(); if (data && data.error) message = data.error; } catch { /* ignore */ }
+      throw new Error(message);
+    }
+    return response.json();
+  },
+  confirmImport: (data) => request('/channel/imports/confirm', { method: 'POST', body: data }),
+
+  // Import history — list committed/staged batches
+  getImportHistory: () => request('/channel/imports'),
+  getImportErrors: (id, params) => {
+    const qs = new URLSearchParams(params || {}).toString();
+    return request(`/channel/imports/${id}/errors${qs ? `?${qs}` : ''}`);
+  },
+  updateImport: (id, data) => request(`/channel/imports/${id}`, { method: 'PUT', body: data }),
+  deleteImport: (id) => request(`/channel/imports/${id}`, { method: 'DELETE' }),
+  // Clears every imported user and all import history (master admin only).
+  clearImportedData: () => request('/channel/imports/registry', { method: 'DELETE' }),
+
+  // Binary template download — fetch with the auth header, then save the blob.
+  // Pass a level (1, 2 or 3) to get a single-level workbook; omit for the combined template.
+  downloadTemplate: async (level) => {
+    const token = localStorage.getItem('vas_token');
+    const qs = level ? `?level=${level}` : '';
+    const response = await fetch(`${API_BASE}/channel/imports/template${qs}`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+    if (!response.ok) {
+      let message = 'Template download failed';
+      try { const data = await response.json(); if (data && data.error) message = data.error; } catch { /* ignore */ }
+      throw new Error(message);
+    }
+    return response.blob();
+  },
 };

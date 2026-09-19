@@ -142,6 +142,7 @@ router.get('/kpis', async (req, res) => {
       [totalEthio],
       [serviceCount],
       [topServices],
+      [topPartners],
     ] = await Promise.all([
       pool.execute(
         `SELECT COALESCE(SUM(total), 0) as total FROM (
@@ -173,6 +174,10 @@ router.get('/kpis', async (req, res) => {
          ORDER BY revenue DESC
          LIMIT 5`,
         [...actualParams, ...actualParams]
+      ),
+      pool.execute(
+        `SELECT partner_name, GROUP_CONCAT(DISTINCT service_name ORDER BY service_name SEPARATOR ', ') as services, SUM(total_revenue) as total_revenue FROM partner_revenue ${actualFilter} GROUP BY partner_name ORDER BY total_revenue DESC LIMIT 5`,
+        actualParams
       ),
     ]);
 
@@ -220,6 +225,11 @@ router.get('/kpis', async (req, res) => {
       achievement_pct: parseFloat(achievement),
       remaining,
       partner_count: partnerCountFuzzy,
+      top_partners: (topPartners || []).map(p => ({
+        partner_name: p.partner_name,
+        services: p.services,
+        total_revenue: parseFloat(p.total_revenue)
+      })),
       active_services: serviceCount[0].count,
       top_services: topServices,
       underperforming_services: underperforming,

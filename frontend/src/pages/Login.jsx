@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
-import { Eye, EyeOff, LogIn, AlertCircle, Shield, Activity, Bell, Bot } from 'lucide-react';
+import { Eye, EyeOff, LogIn, AlertCircle, Shield, Activity, Bell, Bot, ArrowRight, LogOut } from 'lucide-react';
 import toast from 'react-hot-toast';
 
 /* ── Animated background particles ─────────────────────────────────────────── */
@@ -107,6 +107,103 @@ function PulseRing() {
   );
 }
 
+/* ── Section picker shown when a user can reach more than one section ─────── */
+const SECTION_OPTIONS = {
+  VAS: {
+    label: 'VAS Section',
+    desc: 'Dashboard, Revenue, Targets, Services, Reports',
+    accent: 'from-green-600 to-emerald-600',
+    dot: 'bg-green-500',
+    hover: 'hover:border-green-400 hover:shadow-green-100',
+    text: 'text-green-600',
+  },
+  INDIRECT_CHANNEL: {
+    label: 'Indirect Channel',
+    desc: 'Channel Dashboard, Batch & Single Import, Channel Reports',
+    accent: 'from-blue-600 to-indigo-600',
+    dot: 'bg-blue-500',
+    hover: 'hover:border-blue-400 hover:shadow-blue-100',
+    text: 'text-blue-600',
+  },
+};
+
+function SectionChooser({ user, error, choosing, onChoose, onSignOut }) {
+  const sections = user?.available_sections || [];
+
+  return (
+    <div className="min-h-screen bg-white relative overflow-hidden flex items-center justify-center p-6">
+      <AnimatedBackground />
+      <div className="relative z-10 w-full max-w-2xl">
+        <div className="text-center mb-8">
+          <img src="/ethio-telecom-logo.png" alt="Ethio Telecom" className="h-12 mx-auto mb-4" />
+          <h1 className="text-2xl font-black text-gray-900">Choose Your Section</h1>
+          <p className="text-sm text-gray-500 mt-1">
+            Welcome back{user?.full_name ? `, ${user.full_name.split(' ')[0]}` : ''} — your account can access more
+            than one section. Pick the one you want to work in.
+          </p>
+        </div>
+
+        {error && (
+          <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-xl mb-6 flex items-center gap-2 text-sm">
+            <AlertCircle size={18} />
+            <span>{error}</span>
+          </div>
+        )}
+
+        <div className="grid sm:grid-cols-2 gap-4">
+          {sections.map((section) => {
+            const opt = SECTION_OPTIONS[section] || {
+              label: section,
+              desc: 'Open this section',
+              accent: 'from-gray-600 to-gray-700',
+              dot: 'bg-gray-400',
+              hover: 'hover:border-gray-400 hover:shadow-gray-100',
+              text: 'text-gray-600',
+            };
+            const busy = choosing === section;
+            return (
+              <button
+                key={section}
+                type="button"
+                onClick={() => onChoose(section)}
+                disabled={!!choosing}
+                className={`group text-left bg-white rounded-2xl border-2 border-gray-200 p-6 shadow-lg transition-all duration-200 disabled:opacity-60 disabled:cursor-not-allowed ${opt.hover}`}
+              >
+                <div className={`w-11 h-11 rounded-xl bg-gradient-to-r ${opt.accent} flex items-center justify-center mb-4`}>
+                  <Shield size={20} className="text-white" />
+                </div>
+                <p className="font-bold text-gray-900 flex items-center gap-2">
+                  <span className={`w-2 h-2 rounded-full ${opt.dot}`} />
+                  {opt.label}
+                </p>
+                <p className="text-xs text-gray-500 mt-1 leading-snug">{opt.desc}</p>
+                <p className={`mt-4 text-xs font-semibold inline-flex items-center gap-1 ${opt.text}`}>
+                  {busy ? 'Entering…' : 'Enter section'}
+                  <ArrowRight size={12} className="group-hover:translate-x-0.5 transition-transform" />
+                </p>
+              </button>
+            );
+          })}
+        </div>
+
+        <p className="text-center text-xs text-gray-400 mt-6">
+          You can switch to the other section any time from the header.
+        </p>
+        <div className="text-center mt-3">
+          <button
+            type="button"
+            onClick={onSignOut}
+            disabled={!!choosing}
+            className="inline-flex items-center gap-1 text-xs font-medium text-gray-500 hover:text-green-600 transition disabled:opacity-50"
+          >
+            <LogOut size={12} /> Sign in as someone else
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /* ── Main Login Component ──────────────────────────────────────────────────── */
 export default function Login() {
   const [email, setEmail] = useState('');
@@ -115,7 +212,8 @@ export default function Login() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [currentTime, setCurrentTime] = useState(new Date());
-  const { login } = useAuth();
+  const [choosing, setChoosing] = useState(null);
+  const { login, logout, pendingSectionChoice, chooseSection, user } = useAuth();
   const navigate = useNavigate();
 
   useEffect(() => {
@@ -128,15 +226,48 @@ export default function Login() {
     setError('');
     setLoading(true);
     try {
-      await login(email, password);
+      const data = await login(email, password);
       toast.success('Welcome back!');
-      navigate('/dashboard');
+      // Multi-section accounts pick where to go first — the page switches to the
+      // chooser and navigate() happens once a section is selected. The master admin
+      // (GLOBAL scope) administers every section and is never asked.
+      if (data.user.role_scope !== 'GLOBAL'
+        && Array.isArray(data.user.available_sections) && data.user.available_sections.length > 1) return;
+      navigate(data.user.role_scope === 'GLOBAL'
+        ? '/admin/users'
+        : data.user.section === 'INDIRECT_CHANNEL' ? '/channel' : '/dashboard');
     } catch (err) {
       setError(err.message || 'Login failed');
     } finally {
       setLoading(false);
     }
   };
+
+  const handleChoose = async (section) => {
+    setError('');
+    setChoosing(section);
+    try {
+      await chooseSection(section);
+      toast.success(section === 'INDIRECT_CHANNEL' ? 'Entering Indirect Channel' : 'Entering VAS Section');
+      navigate(section === 'INDIRECT_CHANNEL' ? '/channel' : '/dashboard');
+    } catch (err) {
+      setError(err.message || 'Could not open that section');
+    } finally {
+      setChoosing(null);
+    }
+  };
+
+  if (pendingSectionChoice && user) {
+    return (
+      <SectionChooser
+        user={user}
+        error={error}
+        choosing={choosing}
+        onChoose={handleChoose}
+        onSignOut={() => { logout(); setError(''); }}
+      />
+    );
+  }
 
   return (
     <div className="min-h-screen bg-white flex relative overflow-hidden">

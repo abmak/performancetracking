@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Cell, ResponsiveContainer,
 } from 'recharts';
@@ -10,6 +10,12 @@ import { useDateFilter } from '../context/DateFilterContext';
 import { getDateFilter } from '../utils/dateFilter';
 
 const COLORS = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#06b6d4', '#ec4899', '#84cc16', '#f97316', '#6366f1', '#14b8a6', '#a855f7', '#e11d48'];
+
+// Helper: strip commas from number strings like "1,213,722.60" → "1213722.60"
+function parseCommaNumber(v) {
+  if (typeof v === 'number') return v;
+  return parseFloat(String(v).replace(/,/g, '')) || 0;
+}
 
 function formatMonth(m) {
   if (!m) return '';
@@ -55,9 +61,25 @@ export default function PartnerRevenue() {
   const [editRecord, setEditRecord] = useState(null);
   const [editForm, setEditForm] = useState({});
 
+  // Individual records view
+  const [viewMode, setViewMode] = useState('grouped'); // 'grouped' | 'individual'
+  const [recordsList, setRecordsList] = useState({ data: [], pagination: {} });
+  const [recordsPage, setRecordsPage] = useState(1);
+  const [recordsSearch, setRecordsSearch] = useState('');
+  const [recordsService, setRecordsService] = useState('');
+  const [deleteRecordId, setDeleteRecordId] = useState(null);
+  const [deleteRecordConfirm, setDeleteRecordConfirm] = useState(false);
+
   useEffect(() => { loadMonths(); }, []);
-  // When global date changes, clear selectedMonth so it uses the date range instead
-  useEffect(() => { setSelectedMonth(''); }, [startDate, endDate]);
+  // When global date changes (but NOT on initial mount), clear selectedMonth so it uses the date range
+  const didInitRef = useRef(false);
+  useEffect(() => {
+    if (!didInitRef.current) {
+      didInitRef.current = true;
+      return; // skip the initial date-filter mount
+    }
+    setSelectedMonth('');
+  }, [startDate, endDate]);
   // Debounced load — waits 400ms after last date/month change before fetching
   useEffect(() => {
     const t = setTimeout(() => loadData(), 400);
@@ -116,6 +138,22 @@ export default function PartnerRevenue() {
     } catch { /* ignore */ }
   }
 
+  async function loadRecords() {
+    try {
+      const params = { limit: 50, page: recordsPage, ...getDateParams() };
+      if (recordsService) params.service_name = recordsService;
+      if (recordsSearch) params.search = recordsSearch;
+      setRecordsList(await partnersAPI.getRecords(params));
+    } catch { /* ignore */ }
+  }
+
+  useEffect(() => {
+    if (viewMode === 'individual') {
+      const t = setTimeout(() => loadRecords(), 300);
+      return () => clearTimeout(t);
+    }
+  }, [viewMode, startDate, endDate, selectedMonth, recordsPage, recordsSearch, recordsService]);
+
   // Edit a partner record
   function startEdit(record) {
     setEditRecord(record);
@@ -132,12 +170,13 @@ export default function PartnerRevenue() {
     try {
       await partnersAPI.update(editRecord.id, {
         ...editForm,
-        total_revenue: parseFloat(editForm.total_revenue),
-        ethio_share: editForm.ethio_share ? parseFloat(editForm.ethio_share) : null,
+        total_revenue: parseCommaNumber(editForm.total_revenue),
+        ethio_share: editForm.ethio_share ? parseCommaNumber(editForm.ethio_share) : null,
       });
       setEditRecord(null);
       loadPartners();
       loadData();
+      if (viewMode === 'individual') loadRecords();
     } catch (err) { alert('Error: ' + err.message); }
   }
 
@@ -147,6 +186,7 @@ export default function PartnerRevenue() {
       await partnersAPI.delete(id);
       loadPartners();
       loadData();
+      if (viewMode === 'individual') loadRecords();
     } catch (err) { alert('Error: ' + err.message); }
   }
 
@@ -162,6 +202,7 @@ export default function PartnerRevenue() {
       loadMonths();
       loadData();
       loadPartners();
+      if (viewMode === 'individual') loadRecords();
     } catch (err) {
       alert(`❌ Error: ${err.message}`);
     }
@@ -448,19 +489,43 @@ export default function PartnerRevenue() {
       {/* Full Partner List with Delete */}
       <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-6">
         <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
-          <h3 className="text-sm font-semibold text-gray-700">All Partners ({partnerList.pagination?.total || 0})</h3>
+          <div className="flex items-center gap-4">
+            <h3 className="text-sm font-semibold text-gray-700">
+              {viewMode === 'grouped' ? `All Partners (${partnerList.pagination?.total || 0})` : `Partner Records (${recordsList.pagination?.total || 0})`}
+            </h3>
+            <div className="flex bg-gray-100 rounded-lg p-0.5">
+              <button
+                onClick={() => { setViewMode('grouped'); setPartnerPage(1); }}
+                className={`px-3 py-1 text-xs font-medium rounded-md transition ${viewMode === 'grouped' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
+              >
+                Grouped
+              </button>
+              <button
+                onClick={() => { setViewMode('individual'); setRecordsPage(1); }}
+                className={`px-3 py-1 text-xs font-medium rounded-md transition ${viewMode === 'individual' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
+              >
+                By Record
+              </button>
+            </div>
+          </div>
           <div className="flex items-center gap-3">
             <div className="relative">
               <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
               <input
                 type="text"
                 placeholder="Search partners..."
-                value={partnerSearch}
-                onChange={(e) => { setPartnerSearch(e.target.value); setPartnerPage(1); }}
+                value={viewMode === 'grouped' ? partnerSearch : recordsSearch}
+                onChange={(e) => {
+                  if (viewMode === 'grouped') { setPartnerSearch(e.target.value); setPartnerPage(1); }
+                  else { setRecordsSearch(e.target.value); setRecordsPage(1); }
+                }}
                 className="border border-gray-300 rounded-lg pl-8 pr-3 py-1.5 text-sm w-60"
               />
             </div>
-            <select value={selectedService} onChange={(e) => { setSelectedService(e.target.value); setPartnerPage(1); }} className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm">
+            <select value={viewMode === 'grouped' ? selectedService : recordsService} onChange={(e) => {
+              if (viewMode === 'grouped') { setSelectedService(e.target.value); setPartnerPage(1); }
+              else { setRecordsService(e.target.value); setRecordsPage(1); }
+            }} className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm">
               <option value="">All Services</option>
               {summary.map((s, i) => (
                 <option key={i} value={s.service_name}>{s.service_name} ({s.partner_count})</option>
@@ -471,26 +536,67 @@ export default function PartnerRevenue() {
         <div className="overflow-x-auto max-h-[500px] overflow-y-auto">
           <table className="w-full text-sm">
             <thead className="sticky top-0 bg-gray-50">
+              {viewMode === 'grouped' ? (
               <tr>
                 <th className="text-left py-2 px-4 font-semibold text-gray-600">Partner Name</th>
                 <th className="text-left py-2 px-4 font-semibold text-gray-600">Services</th>
                 <th className="text-right py-2 px-4 font-semibold text-gray-600">Total Revenue</th>
                 <th className="text-center py-2 px-4 font-semibold text-gray-600">Entries</th>
               </tr>
+              ) : (
+              <tr>
+                <th className="text-left py-2 px-4 font-semibold text-gray-600">Partner Name</th>
+                <th className="text-left py-2 px-4 font-semibold text-gray-600">Service</th>
+                <th className="text-center py-2 px-4 font-semibold text-gray-600">Month</th>
+                <th className="text-right py-2 px-4 font-semibold text-gray-600">Revenue</th>
+                {(canEdit || canDelete) && <th className="text-center py-2 px-4 font-semibold text-gray-600">Actions</th>}
+              </tr>
+              )}
             </thead>
             <tbody>
-              {partnerList.data?.map((p, i) => (
-                <tr key={i} className="border-t border-gray-50 hover:bg-gray-50">
-                  <td className="py-2 px-4 text-gray-900 max-w-[350px] truncate">{p.partner_name}</td>
-                  <td className="py-2 px-4 text-gray-600 text-xs max-w-[250px] truncate" title={p.services}>{p.services}</td>
-                  <td className="text-right py-2 px-4 font-medium">{formatCurrency(p.total_revenue)}</td>
-                  <td className="text-center py-2 px-4 text-xs text-gray-500">{p.entry_count} entries across {p.service_count} services</td>
-                </tr>
-              ))}
+              {viewMode === 'grouped' ? (
+                partnerList.data?.map((p, i) => (
+                  <tr key={i} className="border-t border-gray-50 hover:bg-gray-50">
+                    <td className="py-2 px-4 text-gray-900 max-w-[350px] truncate">{p.partner_name}</td>
+                    <td className="py-2 px-4 text-gray-600 text-xs max-w-[250px] truncate" title={p.services}>{p.services}</td>
+                    <td className="text-right py-2 px-4 font-medium">{formatCurrency(p.total_revenue)}</td>
+                    <td className="text-center py-2 px-4 text-xs text-gray-500">{p.entry_count} entries across {p.service_count} services</td>
+                  </tr>
+                ))
+              ) : (
+                recordsList.data?.length > 0 ? (
+                  recordsList.data.map((r) => (
+                    <tr key={r.id} className="border-t border-gray-50 hover:bg-gray-50">
+                      <td className="py-2 px-4 text-gray-900 max-w-[250px] truncate" title={r.partner_name}>{r.partner_name}</td>
+                      <td className="py-2 px-4 text-gray-600 text-xs max-w-[180px] truncate" title={r.service_name}>{r.service_name}</td>
+                      <td className="text-center py-2 px-4 text-xs font-medium text-gray-700">{formatMonth(r.revenue_month)}</td>
+                      <td className="text-right py-2 px-4 font-semibold text-gray-900">{formatCurrency(r.total_revenue)}</td>
+                      {(canEdit || canDelete) && (
+                        <td className="text-center py-2 px-4">
+                          <div className="flex items-center justify-center gap-1">
+                            {canEdit && (
+                              <button onClick={() => startEdit(r)} className="p-1 rounded hover:bg-blue-50 text-blue-600" title="Edit record">
+                                <Edit2 size={14} />
+                              </button>
+                            )}
+                            {canDelete && (
+                              <button onClick={() => handleDeleteRecord(r.id)} className="p-1 rounded hover:bg-red-50 text-red-500" title="Delete record">
+                                <Trash2 size={14} />
+                              </button>
+                            )}
+                          </div>
+                        </td>
+                      )}
+                    </tr>
+                  ))
+                ) : (
+                  <tr><td colSpan={5} className="py-8 text-center text-gray-400 text-sm">No records found</td></tr>
+                )
+              )}
             </tbody>
           </table>
         </div>
-        {partnerList.pagination?.pages > 1 && (
+        {viewMode === 'grouped' && partnerList.pagination?.pages > 1 && (
           <div className="flex items-center justify-between px-4 py-3 border-t mt-2 flex-wrap gap-3">
             <span className="text-sm text-gray-500">
               Page {partnerList.pagination.page} of {partnerList.pagination.pages} · {partnerList.pagination.total} partners
@@ -506,6 +612,29 @@ export default function PartnerRevenue() {
               <button
                 onClick={() => setPartnerPage(p => Math.min(partnerList.pagination.pages, p + 1))}
                 disabled={partnerPage >= partnerList.pagination.pages}
+                className="px-3 py-1.5 text-xs font-medium rounded-lg border border-gray-300 text-gray-600 hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                Next →
+              </button>
+            </div>
+          </div>
+        )}
+        {viewMode === 'individual' && recordsList.pagination?.pages > 1 && (
+          <div className="flex items-center justify-between px-4 py-3 border-t mt-2 flex-wrap gap-3">
+            <span className="text-sm text-gray-500">
+              Page {recordsList.pagination.page} of {recordsList.pagination.pages} · {recordsList.pagination.total} records
+            </span>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setRecordsPage(p => Math.max(1, p - 1))}
+                disabled={recordsPage <= 1}
+                className="px-3 py-1.5 text-xs font-medium rounded-lg border border-gray-300 text-gray-600 hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                ← Previous
+              </button>
+              <button
+                onClick={() => setRecordsPage(p => Math.min(recordsList.pagination.pages, p + 1))}
+                disabled={recordsPage >= recordsList.pagination.pages}
                 className="px-3 py-1.5 text-xs font-medium rounded-lg border border-gray-300 text-gray-600 hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed"
               >
                 Next →
@@ -593,12 +722,18 @@ export default function PartnerRevenue() {
               </div>
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">Total Revenue (ETB)</label>
-                <input type="number" step="0.01" value={editForm.total_revenue || ''} onChange={(e) => setEditForm({ ...editForm, total_revenue: e.target.value })}
+                <input type="text" inputMode="decimal" value={editForm.total_revenue || ''} onChange={(e) => {
+                  const raw = e.target.value.replace(/[^0-9.,]/g, '');
+                  setEditForm({ ...editForm, total_revenue: raw });
+                }}
                   className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm" />
               </div>
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">ET Share (ETB)</label>
-                <input type="number" step="0.01" value={editForm.ethio_share || ''} onChange={(e) => setEditForm({ ...editForm, ethio_share: e.target.value })}
+                <input type="text" inputMode="decimal" value={editForm.ethio_share || ''} onChange={(e) => {
+                  const raw = e.target.value.replace(/[^0-9.,]/g, '');
+                  setEditForm({ ...editForm, ethio_share: raw });
+                }}
                   className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm" placeholder="Optional" />
               </div>
               <div>

@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const pool = require('../config/database');
-const { getCached, setCached } = require('../utils/endpointCache');
+const { getCached, setCached, invalidate } = require('../utils/endpointCache');
 
 // Helper: convert YYYY-MM-DD date to YYYY-MM for comparison
 function toMonth(dateStr) {
@@ -331,6 +331,53 @@ router.get('/partners', async (req, res) => {
   }
 });
 
+// GET individual partner revenue records (for edit/delete)
+router.get('/records', async (req, res) => {
+  try {
+    const { revenue_month, start_date, end_date, service_name, search, page = 1, limit = 50 } = req.query;
+    const { where: dateWhere, params: dateParams } = buildDateFilter(start_date, end_date, revenue_month);
+
+    let whereClauses = ['pr.partner_name IS NOT NULL AND pr.partner_name != \'\''];
+    let whereParams = [];
+    // Add date filter conditions if present
+    if (dateWhere) {
+      whereClauses.push(dateWhere.replace('WHERE ', ''));
+      whereParams.push(...dateParams);
+    }
+    if (service_name) { whereClauses.push('pr.service_name = ?'); whereParams.push(service_name); }
+    if (search) { whereClauses.push('pr.partner_name LIKE ?'); whereParams.push(`%${search}%`); }
+    const whereStr = 'WHERE ' + whereClauses.join(' AND ');
+
+    const [countResult] = await pool.execute(
+      `SELECT COUNT(*) as total FROM partner_revenue pr ${whereStr}`,
+      whereParams
+    );
+    const total = countResult[0].total;
+
+    const offset = (parseInt(page) - 1) * parseInt(limit);
+    const [rows] = await pool.execute(
+      `SELECT id, partner_name, service_name, total_revenue, ethio_share, revenue_month, import_batch_id, created_at
+       FROM partner_revenue pr
+       ${whereStr}
+       ORDER BY revenue_month DESC, total_revenue DESC
+       LIMIT ${parseInt(limit)} OFFSET ${offset}`,
+      whereParams
+    );
+
+    res.json({
+      data: rows,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total,
+        pages: Math.ceil(total / parseInt(limit))
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // DELETE revenue data by month (YYYY-MM) — deletes from both tables
 router.delete('/month/:revenueMonth', async (req, res) => {
   try {
@@ -339,25 +386,33 @@ router.delete('/month/:revenueMonth', async (req, res) => {
       return res.status(400).json({ error: 'Invalid month format. Use YYYY-MM.' });
     }
 
-    // Count records from both tables
+    // Only delete BATCH-IMPORTED data — leave manual entries intact
+    // partner_revenue: batch imports have import_batch_id set
+    // actual_revenue: manual entries have source = 'manual'
     const [countPR] = await pool.execute(
-      'SELECT COUNT(*) as cnt, SUM(total_revenue) as total_rev FROM partner_revenue WHERE revenue_month = ?',
+      'SELECT COUNT(*) as cnt, SUM(total_revenue) as total_rev FROM partner_revenue WHERE revenue_month = ? AND import_batch_id IS NOT NULL',
       [revenueMonth]
     );
     const [countAR] = await pool.execute(
-      'SELECT COUNT(*) as cnt, SUM(amount) as total_rev FROM actual_revenue WHERE revenue_month = ?',
+      "SELECT COUNT(*) as cnt, SUM(amount) as total_rev FROM actual_revenue WHERE revenue_month = ? AND (source IS NULL OR source != 'manual')",
       [revenueMonth]
     );
     const totalCnt = (countPR[0].cnt || 0) + (countAR[0].cnt || 0);
     const totalRev = parseFloat(countPR[0].total_rev || 0) + parseFloat(countAR[0].total_rev || 0);
 
     if (totalCnt === 0) {
-      return res.status(404).json({ error: `No revenue data found for ${revenueMonth}` });
+      return res.status(404).json({ error: `No batch-imported revenue data found for ${revenueMonth}. Manual entries are preserved.` });
     }
 
-    // Delete from both tables
-    await pool.execute('DELETE FROM partner_revenue WHERE revenue_month = ?', [revenueMonth]);
-    await pool.execute('DELETE FROM actual_revenue WHERE revenue_month = ?', [revenueMonth]);
+    // Delete only batch-imported records from both tables
+    await pool.execute('DELETE FROM partner_revenue WHERE revenue_month = ? AND import_batch_id IS NOT NULL', [revenueMonth]);
+    await pool.execute("DELETE FROM actual_revenue WHERE revenue_month = ? AND (source IS NULL OR source != 'manual')", [revenueMonth]);
+
+    // Invalidate cached data so the months list refreshes
+    invalidate('/partners/months');
+    invalidate('/partners');
+    invalidate('/partners/summary');
+    invalidate('/partners/top-partners');
 
     res.json({
       message: `Deleted ${totalCnt} records for ${revenueMonth}`,

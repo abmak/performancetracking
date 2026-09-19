@@ -26,6 +26,8 @@ const aiRoutes = require('./routes/ai');
 const actionTaskRoutes = require('./routes/actionTasks');
 const goalCascadeRoutes = require('./routes/goalCascade');
 const notificationRoutes = require('./routes/notifications');
+const channelRoutes = require('./routes/channel');
+const channelImportRoutes = require('./routes/channelImports');
 
 const { authenticate } = require('./middleware/permissions');
 
@@ -74,10 +76,23 @@ app.use('/api/action-tasks', authenticate, actionTaskRoutes);
 app.use('/api/goal-cascade', authenticate, goalCascadeRoutes);
 app.use('/api/notifications', authenticate, notificationRoutes);
 
+// Indirect Channel section — separate tables, separate route namespace
+app.use('/api/channel/imports', authenticate, channelImportRoutes);
+app.use('/api/channel', authenticate, channelRoutes);
+
 // Error handling middleware
 app.use((err, req, res, next) => {
-  console.error('Error:', err);
-  res.status(500).json({ error: 'Internal server error', message: err.message });
+  // Body-parser and multer reject bad requests with a 4xx status on the error
+  // object. Reporting those as a generic 500 hides the real reason (an oversized
+  // upload simply read as "Internal server error"), so pass them through.
+  const status = Number(err.status || err.statusCode) || 500;
+  if (status >= 500) {
+    console.error('Error:', err);
+    res.status(status).json({ error: 'Internal server error', message: err.message });
+  } else {
+    console.warn(`Rejected ${req.method} ${req.originalUrl}: ${err.message}`);
+    res.status(status).json({ error: err.message || 'Request rejected' });
+  }
 });
 
 app.listen(PORT, () => {

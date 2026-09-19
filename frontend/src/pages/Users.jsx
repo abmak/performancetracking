@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Plus, Edit2, Trash2, X, Check, User, Search, Shield, Mail, Phone, Building } from 'lucide-react';
+import { Plus, Edit2, Trash2, X, Check, User, Search, Shield, Mail, Phone, Building, ArrowLeftRight } from 'lucide-react';
 import toast from 'react-hot-toast';
 import { usersAPI, rolesAPI } from '../services/api';
 import { useAuth } from '../context/AuthContext';
@@ -7,10 +7,11 @@ import { useAuth } from '../context/AuthContext';
 const emptyUser = { full_name: '', email: '', username: '', password_hash: '', role_id: '', department: '', section: '', division: '', phone: '', status: 'active', max_ai_questions_per_day: 50 };
 
 export default function Users() {
-  const { hasPermission } = useAuth();
-  const canEdit = hasPermission('users.edit');
-  const canDelete = hasPermission('users.delete');
-  const canCreate = hasPermission('users.create');
+  const { user, hasAnyPermission } = useAuth();
+  // The Indirect Channel section mirrors these permissions as channel_users.*
+  const canEdit = hasAnyPermission('users.edit', 'channel_users.edit');
+  const canDelete = hasAnyPermission('users.delete', 'channel_users.delete');
+  const canCreate = hasAnyPermission('users.create', 'channel_users.create');
   const [users, setUsers] = useState([]);
   const [roles, setRoles] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -20,12 +21,24 @@ export default function Users() {
   const [search, setSearch] = useState('');
   const [filterRole, setFilterRole] = useState('');
   const [saving, setSaving] = useState(false);
+  const [showSectionModal, setShowSectionModal] = useState(false);
+  const [sectionUser, setSectionUser] = useState(null);
+  const [sectionAssignments, setSectionAssignments] = useState([]);
+  const [allRoles, setAllRoles] = useState([]);
+  const [sectionForm, setSectionForm] = useState({ section: 'INDIRECT_CHANNEL', role_id: '' });
 
   useEffect(() => { loadData(); }, []);
 
+  // When section is null (admin mode / cross-section), no filter is sent
+  // and the backend returns all sections. Otherwise scope to the user's section.
+  const sectionFilter = user?.section || undefined;
+
   async function loadData() {
     try {
-      const [usersData, rolesData] = await Promise.all([usersAPI.getAll(), rolesAPI.getAll()]);
+      const [usersData, rolesData] = await Promise.all([
+        usersAPI.getAll(sectionFilter ? { section: sectionFilter } : {}),
+        rolesAPI.getAll(sectionFilter ? { section: sectionFilter } : {}),
+      ]);
       setUsers(usersData);
       setRoles(rolesData);
     } catch (err) {
@@ -37,6 +50,7 @@ export default function Users() {
   async function loadFiltered() {
     try {
       const params = {};
+      if (sectionFilter) params.section = sectionFilter;
       if (search) params.search = search;
       if (filterRole) params.role_id = filterRole;
       const data = await usersAPI.getAll(params);
@@ -108,6 +122,62 @@ export default function Users() {
     }
   }
 
+  async function openSectionModal(u) {
+    setSectionUser(u);
+    try {
+      const [assignments, rolesData] = await Promise.all([
+        usersAPI.getSections(u.id),
+        rolesAPI.getAll(),
+      ]);
+      setSectionAssignments(assignments);
+      setAllRoles(rolesData);
+      setSectionForm({ section: 'INDIRECT_CHANNEL', role_id: '' });
+      setShowSectionModal(true);
+    } catch (err) {
+      toast.error('Failed to load section data');
+    }
+  }
+
+  async function handleAddSection() {
+    if (!sectionForm.role_id) {
+      toast.error('Please select a role');
+      return;
+    }
+    try {
+      // The role must grant at least one permission for the section being assigned,
+      // otherwise the user lands in that section with nothing to do there.
+      const role = await rolesAPI.getOne(sectionForm.role_id);
+      const isIC = sectionForm.section === 'INDIRECT_CHANNEL';
+      // permissions.section is the authoritative column — no module-name guessing
+      const forSection = (role.permissions || []).filter(p => p.section === sectionForm.section);
+      if (forSection.length === 0) {
+        toast.error(`Please choose at least one permission for ${isIC ? 'Indirect Channel' : 'VAS Section'} — role "${role.name}" has none. Pick a role that grants permissions in this section.`);
+        return;
+      }
+
+      await usersAPI.setSection(sectionUser.id, sectionForm);
+      toast.success('Section assignment saved');
+      const updated = await usersAPI.getSections(sectionUser.id);
+      setSectionAssignments(updated);
+      loadData();
+    } catch (err) {
+      toast.error(err.message);
+    }
+  }
+
+  async function handleRemoveSection(section) {
+    if (!confirm(`Remove ${section} section assignment?`)) return;
+    try {
+      await usersAPI.removeSection(sectionUser.id, section);
+      toast.success('Section assignment removed');
+      const updated = await usersAPI.getSections(sectionUser.id);
+      setSectionAssignments(updated);
+      loadData();
+    } catch (err) {
+      toast.error(err.message);
+    }
+  }
+
   const roleColors = {
     Admin: 'bg-red-100 text-red-700',
     Manager: 'bg-blue-100 text-blue-700',
@@ -172,7 +242,7 @@ export default function Users() {
                 <th className="text-left px-4 py-3 text-xs font-medium text-gray-500 uppercase">Contact</th>
                 <th className="text-left px-4 py-3 text-xs font-medium text-gray-500 uppercase">Role</th>
                 <th className="text-left px-4 py-3 text-xs font-medium text-gray-500 uppercase">Department</th>
-                <th className="text-left px-4 py-3 text-xs font-medium text-gray-500 uppercase">Section</th>
+                <th className="text-left px-4 py-3 text-xs font-medium text-gray-500 uppercase">Sections</th>
                 <th className="text-left px-4 py-3 text-xs font-medium text-gray-500 uppercase">Division</th>
                 <th className="text-left px-4 py-3 text-xs font-medium text-gray-500 uppercase">Status</th>
                 <th className="text-left px-4 py-3 text-xs font-medium text-gray-500 uppercase">AI Quota</th>
@@ -203,7 +273,16 @@ export default function Users() {
                     </span>
                   </td>
                   <td className="px-4 py-3 text-sm text-gray-600">{user.department || '—'}</td>
-                  <td className="px-4 py-3 text-sm text-gray-600">{user.section || '—'}</td>
+                  <td className="px-4 py-3">
+                    {canEdit ? (
+                      <button onClick={() => openSectionModal(user)} className="flex items-center gap-1 text-sm text-blue-600 hover:text-blue-800 hover:underline">
+                        <ArrowLeftRight size={12} />
+                        {user.section || 'All'}
+                      </button>
+                    ) : (
+                      <span className="text-sm text-gray-600">{user.section || '—'}</span>
+                    )}
+                  </td>
                   <td className="px-4 py-3 text-sm text-gray-600">{user.division || '—'}</td>
                   <td className="px-4 py-3">
                     <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${
@@ -322,6 +401,87 @@ export default function Users() {
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* Section Assignment Modal */}
+      {showSectionModal && sectionUser && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <div className="bg-white rounded-xl shadow-xl w-full max-w-lg mx-4 p-6">
+            <div className="flex items-center justify-between mb-4">
+              <div>
+                <h2 className="text-lg font-semibold">Section Assignments</h2>
+                <p className="text-sm text-gray-500">Manage which sections {sectionUser.full_name} can access and their role in each</p>
+              </div>
+              <button onClick={() => setShowSectionModal(false)} className="p-1 hover:bg-gray-100 rounded"><X size={18} /></button>
+            </div>
+
+            {/* Current assignments */}
+            <div className="space-y-2 mb-4">
+              {sectionAssignments.length === 0 ? (
+                <p className="text-sm text-gray-400 text-center py-4">No section assignments. Add one below.</p>
+              ) : (
+                sectionAssignments.map((sa) => (
+                  <div key={sa.id} className="flex items-center justify-between p-3 bg-gray-50 rounded-lg border border-gray-200">
+                    <div className="flex items-center gap-3">
+                      <div className={`w-2 h-2 rounded-full ${sa.section === 'VAS' ? 'bg-green-500' : 'bg-blue-500'}`} />
+                      <div>
+                        <p className="text-sm font-medium text-gray-800">
+                          {sa.section === 'VAS' ? 'VAS Section' : 'Indirect Channel'}
+                        </p>
+                        <p className="text-xs text-gray-500">Role: {sa.role_name}</p>
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => handleRemoveSection(sa.section)}
+                      className="p-1.5 rounded-lg hover:bg-red-50 text-gray-400 hover:text-red-600"
+                      title="Remove assignment"
+                    >
+                      <Trash2 size={14} />
+                    </button>
+                  </div>
+                ))
+              )}
+            </div>
+
+            {/* Add new assignment */}
+            <div className="border-t border-gray-100 pt-4">
+              <p className="text-sm font-medium text-gray-700 mb-2">Add Section Assignment</p>
+              <div className="flex gap-2">
+                <select
+                  value={sectionForm.section}
+                  onChange={(e) => setSectionForm({ ...sectionForm, section: e.target.value })}
+                  className="flex-1 border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500"
+                >
+                  <option value="VAS">VAS Section</option>
+                  <option value="INDIRECT_CHANNEL">Indirect Channel</option>
+                </select>
+                <select
+                  value={sectionForm.role_id}
+                  onChange={(e) => setSectionForm({ ...sectionForm, role_id: e.target.value })}
+                  className="flex-1 border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500"
+                >
+                  <option value="">Select role...</option>
+                  {allRoles.map(r => (
+                    <option key={r.id} value={r.id}>{r.name}</option>
+                  ))}
+                </select>
+                <button
+                  onClick={handleAddSection}
+                  disabled={!sectionForm.role_id}
+                  className="px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  <Plus size={16} />
+                </button>
+              </div>
+            </div>
+
+            <div className="flex justify-end mt-4">
+              <button onClick={() => setShowSectionModal(false)} className="px-4 py-2 text-sm text-gray-700 bg-gray-100 rounded-lg hover:bg-gray-200">
+                Done
+              </button>
+            </div>
           </div>
         </div>
       )}

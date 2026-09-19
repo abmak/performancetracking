@@ -5,6 +5,12 @@ import { useAuth } from '../context/AuthContext';
 import { formatCurrency, MONTH_OPTIONS } from '../utils/helpers';
 import toast from 'react-hot-toast';
 
+// Helper: strip commas from number strings like "1,213,722.60" → "1213722.60"
+function parseCommaNumber(v) {
+  if (typeof v === 'number') return v;
+  return parseFloat(String(v).replace(/,/g, '')) || 0;
+}
+
 export default function Revenue() {
   const { hasPermission } = useAuth();
   const canEdit = hasPermission('revenue.edit');
@@ -52,7 +58,7 @@ export default function Revenue() {
   async function handleSubmit(e) {
     e.preventDefault();
     try {
-      await revenueAPI.create({ ...form, service_id: parseInt(form.service_id), amount: parseFloat(form.amount) });
+      await revenueAPI.create({ ...form, service_id: parseInt(form.service_id), amount: parseCommaNumber(form.amount) });
       toast.success('Revenue entry added');
       setShowModal(false);
       setForm({ service_id: '', partner_name: '', amount: '', revenue_month: filters.revenue_month || '2026-06', notes: '' });
@@ -82,7 +88,7 @@ export default function Revenue() {
       await revenueAPI.update(editRecord.id, {
         ...editForm,
         service_id: parseInt(editForm.service_id),
-        amount: parseFloat(editForm.amount),
+        amount: parseCommaNumber(editForm.amount),
       });
       toast.success('Entry updated');
       setEditRecord(null);
@@ -230,7 +236,11 @@ export default function Revenue() {
               </div>
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">Amount (ETB) *</label>
-                <input required type="number" min="0" step="0.01" value={form.amount} onChange={(e) => setForm({ ...form, amount: e.target.value })} className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm" placeholder="e.g., 2500000" />
+                <input required type="text" inputMode="decimal" value={form.amount} onChange={(e) => {
+                  // Strip non-numeric chars except digits, dots, and commas
+                  const raw = e.target.value.replace(/[^0-9.,]/g, '');
+                  setForm({ ...form, amount: raw });
+                }} className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm" placeholder="e.g., 2,500,000" />
               </div>
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">Revenue Month *</label>
@@ -275,7 +285,10 @@ export default function Revenue() {
               </div>
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">Amount (ETB)</label>
-                <input type="number" min="0" step="0.01" value={editForm.amount || ''} onChange={(e) => setEditForm({ ...editForm, amount: e.target.value })} className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm" />
+                <input type="text" inputMode="decimal" value={editForm.amount || ''} onChange={(e) => {
+                  const raw = e.target.value.replace(/[^0-9.,]/g, '');
+                  setEditForm({ ...editForm, amount: raw });
+                }} className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm" />
               </div>
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">Revenue Month</label>

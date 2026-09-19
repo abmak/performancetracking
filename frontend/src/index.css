@@ -239,6 +239,20 @@ body {
   to { opacity: 1; transform: translateY(0); }
 }
 
+/* Live geographic map pins — one ring per pin expanding outward forever, so the
+   Distribution Map feels like it is reporting in real time rather than a still. */
+@keyframes mapPinPulse {
+  0% { transform: scale(0.6); opacity: 0.5; }
+  70% { opacity: 0.08; }
+  100% { transform: scale(2.4); opacity: 0; }
+}
+.map-pin-pulse {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: mapPinPulse 2.6s ease-out infinite;
+  pointer-events: none;
+}
+
 /* Scrollbar styling */
 ::-webkit-scrollbar {
   width: 6px;

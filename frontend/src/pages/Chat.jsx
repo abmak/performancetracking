@@ -1,7 +1,8 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { MessageCircle, Users, Plus, Search, Send, ArrowLeft, Settings, Trash2, X, UserPlus, Hash, Smile, Image, Mic, Square, Paperclip, FileText } from 'lucide-react';
-import { chatAPI, usersAPI } from '../services/api';
+import { MessageCircle, Users, Plus, Search, Send, ArrowLeft, Settings, Trash2, X, UserPlus, Hash, Smile, Image, Mic, Square, Paperclip, FileText, Volume2, VolumeX } from 'lucide-react';
+import { chatAPI } from '../services/api';
 import { useAuth } from '../context/AuthContext';
+import { playSentSound, playIncomingSound, playSoundPreview, isChatSoundMuted, setChatSoundMuted } from '../utils/chatSounds';
 
 // Common emojis for the picker
 const EMOJI_CATEGORIES = [
@@ -63,6 +64,12 @@ export default function Chat() {
   const [sending, setSending] = useState(false);
   const messagesEndRef = useRef(null);
 
+  // Sound effects + typing indicator
+  const [soundMuted, setSoundMuted] = useState(() => isChatSoundMuted());
+  const [typingUsers, setTypingUsers] = useState([]);
+  const maxMessageIdRef = useRef(null);
+  const lastTypingSentRef = useRef(0);
+
   // Emoji picker
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
   const [emojiCategory, setEmojiCategory] = useState(0);
@@ -112,17 +119,20 @@ export default function Chat() {
       setGroups(userGroups);
     } catch (err) { console.error('Groups error:', err); }
     try {
-      const users = await usersAPI.getAll({ status: 'active' }).catch(() => []);
+      // Chat's own contact list: everyone in the sections this user can chat in,
+      // including people who switch into this section from another one.
+      const users = await chatAPI.getContacts().catch(() => []);
       setAllUsers(Array.isArray(users) ? users : (users?.data || []));
-    } catch (err) { console.error('Users error:', err); }
+    } catch (err) { console.error('Contacts error:', err); }
   }, [currentUserId]);
 
   useEffect(() => { loadData(); }, [loadData]);
 
-  // Auto-refresh messages every 3 seconds
+  // Auto-refresh messages + typing status every 3 seconds
   useEffect(() => {
     if (!activeChat) return;
-    const interval = setInterval(() => { loadMessages(activeChat); }, 3000);
+    loadTyping(activeChat);
+    const interval = setInterval(() => { loadMessages(activeChat); loadTyping(activeChat); }, 3000);
     return () => clearInterval(interval);
   }, [activeChat?.id, activeChat?.type]);
 
@@ -156,15 +166,57 @@ export default function Chat() {
       } else {
         msgs = await chatAPI.getGroupMessages(chat.id);
       }
-      setMessages(msgs);
+      const list = Array.isArray(msgs) ? msgs : [];
+      const highestId = list.reduce((max, m) => (m.id > max ? m.id : max), 0);
+      const previousHigh = maxMessageIdRef.current;
+      if (list.length) maxMessageIdRef.current = highestId;
+      // Chime only for genuinely new messages from other people.
+      if (previousHigh !== null && list.some(m => m.id > previousHigh && m.sender_id !== currentUserId)) {
+        playIncomingSound();
+      }
+      setMessages(list);
       setTimeout(() => messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 100);
     } catch (err) { console.error(err); }
+  }
+
+  // Who is typing in the open chat — best effort, never blocks the UI
+  async function loadTyping(chat) {
+    if (!chat || !currentUserId) return;
+    try {
+      const params = chat.type === 'dm'
+        ? { user_id: currentUserId, other_user_id: chat.id }
+        : { user_id: currentUserId, group_id: chat.id };
+      const data = await chatAPI.getTyping(params);
+      setTypingUsers(Array.isArray(data?.typing) ? data.typing : []);
+    } catch (err) { /* typing indicator is best-effort */ }
+  }
+
+  // Throttled "I am typing" heartbeat; the server expires it automatically.
+  function handleDraftChange(value) {
+    setNewMessage(value);
+    if (!activeChat || !currentUserId || !value.trim()) return;
+    const now = Date.now();
+    if (now - lastTypingSentRef.current < 2500) return;
+    lastTypingSentRef.current = now;
+    const payload = activeChat.type === 'dm'
+      ? { user_id: currentUserId, receiver_id: activeChat.id }
+      : { user_id: currentUserId, group_id: activeChat.id };
+    chatAPI.sendTyping(payload).catch(() => {});
+  }
+
+  function toggleSound() {
+    const next = !soundMuted;
+    setSoundMuted(next);
+    setChatSoundMuted(next);
+    if (!next) playSoundPreview();
   }
 
   async function openChat(chat) {
     setActiveChat(chat);
     setMessages([]);
     setNewMessage('');
+    maxMessageIdRef.current = null;
+    setTypingUsers([]);
     setImagePreview(null);
     setImageFile(null);
     setAudioBlob(null);
@@ -225,6 +277,8 @@ export default function Chat() {
       } else {
         await chatAPI.sendGroupMessage(activeChat.id, payload);
       }
+      playSentSound();
+      lastTypingSentRef.current = 0;
       setNewMessage('');
       setImagePreview(null);
       setImageFile(null);
@@ -402,6 +456,12 @@ export default function Chat() {
   const filteredGroups = groups.filter(g => !searchQuery || g.name?.toLowerCase().includes(searchQuery.toLowerCase()));
   const availableUsers = allUsers.filter(u => u.id !== currentUserId && !selectedMembers.includes(u.id));
 
+  const typingLabel = typingUsers.length === 1
+    ? `${typingUsers[0].name} is typing…`
+    : typingUsers.length === 2
+      ? `${typingUsers[0].name} and ${typingUsers[1].name} are typing…`
+      : `${typingUsers.length} people are typing…`;
+
   // Render message content based on type
   function renderMessageContent(msg, isOwn) {
     switch (msg.message_type) {
@@ -567,14 +627,32 @@ export default function Chat() {
                 </div>
                 <div>
                   <h3 className="text-sm font-semibold text-gray-900">{activeChat.name}</h3>
-                  <p className="text-xs text-gray-500">{activeChat.type === 'group' ? 'Group Chat' : 'Direct Message'}</p>
+                  {typingUsers.length > 0 ? (
+                    <p className="text-xs text-blue-600 font-medium flex items-center gap-1.5">
+                      <span className="flex items-center gap-0.5">
+                        <span className="w-1 h-1 bg-blue-500 rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
+                        <span className="w-1 h-1 bg-blue-500 rounded-full animate-bounce" style={{ animationDelay: '140ms' }} />
+                        <span className="w-1 h-1 bg-blue-500 rounded-full animate-bounce" style={{ animationDelay: '280ms' }} />
+                      </span>
+                      {typingLabel}
+                    </p>
+                  ) : (
+                    <p className="text-xs text-gray-500">{activeChat.type === 'group' ? 'Group Chat' : 'Direct Message'}</p>
+                  )}
                 </div>
               </div>
-              {activeChat.type === 'group' && (
-                <button onClick={() => openGroupSettings(activeChat)} className="p-2 rounded-lg hover:bg-gray-200 text-gray-600">
-                  <Settings size={18} />
+              <div className="flex items-center gap-1">
+                <button onClick={toggleSound}
+                  className={`p-2 rounded-lg transition ${soundMuted ? 'text-gray-400 hover:bg-gray-200' : 'text-blue-600 hover:bg-blue-50'}`}
+                  title={soundMuted ? 'Chat sounds are off — click to enable' : 'Chat sounds are on — click to mute'}>
+                  {soundMuted ? <VolumeX size={18} /> : <Volume2 size={18} />}
                 </button>
-              )}
+                {activeChat.type === 'group' && (
+                  <button onClick={() => openGroupSettings(activeChat)} className="p-2 rounded-lg hover:bg-gray-200 text-gray-600">
+                    <Settings size={18} />
+                  </button>
+                )}
+              </div>
             </div>
 
             {/* Messages */}
@@ -761,7 +839,7 @@ export default function Chat() {
                 {/* Text Input */}
                 <textarea
                   value={newMessage}
-                  onChange={e => setNewMessage(e.target.value)}
+                  onChange={e => handleDraftChange(e.target.value)}
                   onKeyDown={handleKeyDown}
                   placeholder="Type a message..."
                   rows={1}

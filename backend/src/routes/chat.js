@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const pool = require('../config/database');
+const { CHAT_MODULES, memberOfSectionSql, allowedSectionsFor } = require('../utils/sectionMembership');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
@@ -43,13 +44,64 @@ const uploadSingleFile = (req, res, next) => {
 // Chat media is served publicly from server.js (/api/chat/media) because browser
 // <img>/<audio>/<a> tags cannot attach the Authorization header.
 
+// ── Helper: get sections the caller may chat in ─────────────────────────
+// Returns null when the user can chat with everyone (cross-section / GLOBAL).
+// Returns an array like ['VAS', 'INDIRECT_CHANNEL'] when scoped. Besides the
+// section they are in, this includes any section where their assigned role
+// really holds a chat permission and they are able to switch into it — the same
+// rule that decides who is visible to them (see utils/sectionMembership).
+async function getCallerSections(userId, primarySection) {
+  return allowedSectionsFor(userId, primarySection, CHAT_MODULES);
+}
+
+// GET /api/chat/contacts — everyone the caller may start a conversation with.
+// Chat needs its own list rather than the users-management one: a user who can
+// switch into this section and holds a chat permission there belongs in it, even
+// though their home section is the other one.
+router.get('/contacts', async (req, res) => {
+  try {
+    const allowedSections = await getCallerSections(req.user?.id, req.user?.section || null);
+
+    let where = `WHERE u.status = 'active'`;
+    const params = [];
+    if (allowedSections) {
+      const membership = memberOfSectionSql('u', allowedSections, CHAT_MODULES);
+      where += ` AND ${membership.sql}`;
+      params.push(...membership.params);
+    }
+
+    const [rows] = await pool.execute(
+      `SELECT u.id, u.full_name, u.email, u.username, u.phone, u.department, u.section, u.avatar_url
+       FROM users u
+       ${where}
+       ORDER BY u.full_name`,
+      params
+    );
+    res.json(rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ============ DIRECT MESSAGES ============
 
 // GET conversations list (latest message per user)
+// Only returns conversations with users in the caller's allowed sections.
 router.get('/conversations', async (req, res) => {
   try {
     const { user_id } = req.query;
     if (!user_id) return res.status(400).json({ error: 'user_id required' });
+
+    const allowedSections = await getCallerSections(user_id, req.user?.section || null);
+
+    // Build the section filter for the other user
+    let sectionFilter = '';
+    let sectionParams = [];
+    if (allowedSections) {
+      const membership = memberOfSectionSql('u', allowedSections, CHAT_MODULES);
+      sectionFilter = `AND ${membership.sql}`;
+      sectionParams = membership.params;
+    }
 
     const [rows] = await pool.execute(
       `SELECT 
@@ -70,10 +122,10 @@ router.get('/conversations', async (req, res) => {
               OR (cm2.sender_id = u.id AND cm2.receiver_id = ?)
          )
        )
-       WHERE u.id != ? AND u.status = 'active'
+       WHERE u.id != ? AND u.status = 'active' ${sectionFilter}
        GROUP BY u.id, u.full_name, u.email, u.phone, latest.message_text, latest.created_at, latest.sender_id
        ORDER BY latest.created_at DESC`,
-      [user_id, user_id, user_id, user_id, user_id, user_id]
+      [user_id, user_id, user_id, user_id, user_id, user_id, ...sectionParams]
     );
     res.json(rows);
   } catch (error) {
@@ -112,11 +164,25 @@ router.get('/messages', async (req, res) => {
 });
 
 // POST send direct message
+// Restricts messaging to users within the caller's allowed sections.
 router.post('/send', async (req, res) => {
   try {
     const { sender_id, receiver_id, message_text, message_type = 'text', media_url } = req.body;
     if (!sender_id || !receiver_id) {
       return res.status(400).json({ error: 'sender_id and receiver_id required' });
+    }
+
+    // Section check: receiver must be in one of the caller's allowed sections
+    const allowedSections = await getCallerSections(sender_id, req.user?.section || null);
+    if (allowedSections) {
+      const membership = memberOfSectionSql('ru', allowedSections, CHAT_MODULES);
+      const [receiver] = await pool.execute(
+        `SELECT ru.section FROM users ru WHERE ru.id = ? AND ${membership.sql}`,
+        [receiver_id, ...membership.params]
+      );
+      if (receiver.length === 0) {
+        return res.status(403).json({ error: 'You can only message users within your accessible sections' });
+      }
     }
 
     const [result] = await pool.execute(
@@ -139,9 +205,12 @@ router.post('/send', async (req, res) => {
 // ============ GROUPS ============
 
 // GET all groups (or groups for a user)
+// Groups are scoped to the caller's allowed sections.
 router.get('/groups', async (req, res) => {
   try {
     const { user_id } = req.query;
+    const allowedSections = await getCallerSections(user_id || req.user?.id, req.user?.section || null);
+
     let query, params;
     if (user_id) {
       query = `SELECT cg.*, u.full_name as creator_name,
@@ -150,8 +219,7 @@ router.get('/groups', async (req, res) => {
         (SELECT MAX(created_at) FROM chat_messages WHERE group_id = cg.id) as last_message_at
        FROM chat_groups cg
        JOIN users u ON cg.created_by = u.id
-       WHERE cg.id IN (SELECT group_id FROM chat_group_members WHERE user_id = ?)
-       ORDER BY last_message_at DESC, cg.created_at DESC`;
+       WHERE cg.id IN (SELECT group_id FROM chat_group_members WHERE user_id = ?)`;
       params = [user_id];
     } else {
       query = `SELECT cg.*, u.full_name as creator_name,
@@ -159,10 +227,21 @@ router.get('/groups', async (req, res) => {
         (SELECT COUNT(*) FROM chat_messages WHERE group_id = cg.id) as message_count,
         (SELECT MAX(created_at) FROM chat_messages WHERE group_id = cg.id) as last_message_at
        FROM chat_groups cg
-       JOIN users u ON cg.created_by = u.id
-       ORDER BY last_message_at DESC, cg.created_at DESC`;
+       JOIN users u ON cg.created_by = u.id`;
       params = [];
     }
+
+    // Filter groups to those created by users in the allowed sections. The
+    // per-user branch above already filters with WHERE, so it needs AND instead —
+    // appending a second WHERE made the whole query a syntax error.
+    if (allowedSections) {
+      const membership = memberOfSectionSql('u', allowedSections, CHAT_MODULES);
+      query += user_id ? ` AND ${membership.sql}` : ` WHERE ${membership.sql}`;
+      params.push(...membership.params);
+    }
+
+    query += ' ORDER BY last_message_at DESC, cg.created_at DESC';
+
     const [rows] = await pool.execute(query, params);
     res.json(rows);
   } catch (error) {
@@ -194,10 +273,25 @@ router.get('/groups/:id', async (req, res) => {
 });
 
 // POST create group
+// Only users in the caller's allowed sections can be added as members.
 router.post('/groups', async (req, res) => {
   try {
     const { name, description, created_by, member_ids = [] } = req.body;
     if (!name || !created_by) return res.status(400).json({ error: 'name and created_by required' });
+
+    // Section check: all members must be in the caller's allowed sections
+    const allowedSections = await getCallerSections(created_by, req.user?.section || null);
+    let validMemberIds = [...new Set(member_ids.filter(id => id !== created_by))];
+    if (allowedSections && validMemberIds.length > 0) {
+      const placeholders = validMemberIds.map(() => '?').join(',');
+      const membership = memberOfSectionSql('m', allowedSections, CHAT_MODULES);
+      const [members] = await pool.execute(
+        `SELECT m.id FROM users m WHERE m.id IN (${placeholders}) AND ${membership.sql}`,
+        [...validMemberIds, ...membership.params]
+      );
+      // Keep only members in the allowed sections
+      validMemberIds = members.map(m => m.id);
+    }
 
     const [result] = await pool.execute(
       'INSERT INTO chat_groups (name, description, created_by) VALUES (?, ?, ?)',
@@ -211,9 +305,8 @@ router.post('/groups', async (req, res) => {
       [groupId, created_by, 'admin']
     );
 
-    // Add other members
-    const uniqueMembers = [...new Set(member_ids.filter(id => id !== created_by))];
-    for (const memberId of uniqueMembers) {
+    // Add other members (allowed sections only)
+    for (const memberId of validMemberIds) {
       await pool.execute(
         'INSERT IGNORE INTO chat_group_members (group_id, user_id, role) VALUES (?, ?, ?)',
         [groupId, memberId, 'member']
@@ -253,12 +346,25 @@ router.delete('/groups/:id', async (req, res) => {
 });
 
 // POST add members to group
+// Only users in the caller's allowed sections can be added.
 router.post('/groups/:id/members', async (req, res) => {
   try {
     const { user_ids } = req.body;
     if (!user_ids || !Array.isArray(user_ids)) return res.status(400).json({ error: 'user_ids array required' });
 
-    for (const uid of user_ids) {
+    const allowedSections = await getCallerSections(req.user?.id, req.user?.section || null);
+    let validIds = user_ids;
+    if (allowedSections && user_ids.length > 0) {
+      const placeholders = user_ids.map(() => '?').join(',');
+      const membership = memberOfSectionSql('u', allowedSections, CHAT_MODULES);
+      const [users] = await pool.execute(
+        `SELECT u.id FROM users u WHERE u.id IN (${placeholders}) AND ${membership.sql}`,
+        [...user_ids, ...membership.params]
+      );
+      validIds = users.map(u => u.id);
+    }
+
+    for (const uid of validIds) {
       await pool.execute(
         'INSERT IGNORE INTO chat_group_members (group_id, user_id) VALUES (?, ?)',
         [req.params.id, uid]
@@ -408,6 +514,77 @@ router.get('/unread/:userId', async (req, res) => {
       [req.params.userId, req.params.userId, req.params.userId]
     );
     res.json({ direct: dmCount[0].cnt, groups: groupCount[0].cnt });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============ TYPING INDICATOR ============
+// Typing is a short-lived signal, so it lives in memory rather than the DB.
+// The client re-sends a heartbeat every couple of seconds while typing, and
+// entries expire on their own shortly after the user stops.
+const TYPING_TTL_MS = 7000;
+const typingState = new Map(); // key -> { userId, receiverId, groupId, ts }
+
+function typingKey(userId, receiverId, groupId) {
+  return groupId ? `${userId}|g${groupId}` : `${userId}|d${receiverId}`;
+}
+
+function pruneTyping() {
+  const now = Date.now();
+  for (const [key, entry] of typingState) {
+    if (now - entry.ts > TYPING_TTL_MS) typingState.delete(key);
+  }
+}
+
+// POST /typing — heartbeat sent by the user who is typing
+router.post('/typing', (req, res) => {
+  try {
+    const { user_id, receiver_id, group_id } = req.body || {};
+    if (!user_id) return res.status(400).json({ error: 'user_id required' });
+    pruneTyping();
+    typingState.set(typingKey(user_id, receiver_id, group_id), {
+      userId: Number(user_id),
+      receiverId: receiver_id ? Number(receiver_id) : null,
+      groupId: group_id ? Number(group_id) : null,
+      ts: Date.now(),
+    });
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /typing — the other participants currently typing in a chat
+router.get('/typing', async (req, res) => {
+  try {
+    const { user_id, other_user_id, group_id } = req.query;
+    if (!user_id) return res.status(400).json({ error: 'user_id required' });
+    pruneTyping();
+
+    const me = Number(user_id);
+    const typingUserIds = new Set();
+    for (const entry of typingState.values()) {
+      if (entry.userId === me) continue;
+      if (group_id) {
+        if (entry.groupId !== Number(group_id)) continue;
+      } else if (other_user_id) {
+        if (entry.userId !== Number(other_user_id) || entry.receiverId !== me) continue;
+      } else {
+        continue;
+      }
+      typingUserIds.add(entry.userId);
+    }
+
+    const ids = [...typingUserIds];
+    if (ids.length === 0) return res.json({ typing: [] });
+
+    const placeholders = ids.map(() => '?').join(',');
+    const [rows] = await pool.execute(
+      `SELECT id, full_name FROM users WHERE id IN (${placeholders})`,
+      ids
+    );
+    res.json({ typing: rows.map(r => ({ id: r.id, name: r.full_name || 'Someone' })) });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

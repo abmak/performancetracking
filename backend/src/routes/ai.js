@@ -151,7 +151,6 @@ async function buildVASContext() {
       `SELECT COALESCE(SUM(ar.amount), 0) as total_revenue
        FROM actual_revenue ar`
     );
-    // Filter out corrupt manual revenue records (null months or extreme values)
     const manualTotal = Number(actRows[0]?.total_revenue || 0);
     context.total_revenue = Number(revRows[0]?.total_revenue || 0) + (manualTotal < 1e12 ? manualTotal : 0);
     context.partner_count = Number(revRows[0]?.partner_count || 0);
@@ -159,16 +158,16 @@ async function buildVASContext() {
     const [services] = await pool.execute('SELECT * FROM vas_services ORDER BY name');
     context.services = services.map(s => ({ name: s.name, id: s.id }));
 
-    // Get ALL targets (with or without dates) for complete picture
+    // Get ALL targets — keep individual rows for multi-target services
     const [targets] = await pool.execute(
-      `SELECT rt.service_name, SUM(rt.target_amount) as total_target, rt.period_type,
+      `SELECT rt.id, rt.service_name, rt.target_amount, rt.period_type,
               rt.target_start_date, rt.target_end_date
        FROM revenue_targets rt
-       GROUP BY rt.service_name ORDER BY rt.service_name`
+       ORDER BY rt.service_name, rt.target_start_date`
     );
     context.targets = targets.map(t => ({
       service: t.service_name,
-      target: Number(t.total_target),
+      target: Number(t.target_amount),
       period: t.period_type,
       start: t.target_start_date,
       end: t.target_end_date,
@@ -187,12 +186,42 @@ async function buildVASContext() {
     svcRevenue.forEach(r => { revenueMap[r.service_name] = (revenueMap[r.service_name] || 0) + Number(r.actual); });
     manualRevenue.forEach(r => { revenueMap[r.service_name] = (revenueMap[r.service_name] || 0) + Number(r.actual); });
 
-    // Include ALL services — even those with no revenue yet
-    context.achievements = targets.map(t => {
-      const targetVal = Number(t.total_target);
-      const actual = revenueMap[t.service_name] || 0;
-      const pct = targetVal > 0 ? Math.round((actual / targetVal) * 100) : 0;
-      return { service: t.service_name, actual, target: targetVal, achievement_pct: pct };
+    // Per-service monthly revenue breakdown
+    const [monthlyByService] = await pool.execute(
+      `SELECT service_name, revenue_month, SUM(total_revenue) as revenue
+       FROM partner_revenue GROUP BY service_name, revenue_month
+       ORDER BY service_name, revenue_month`
+    );
+    context.monthly_by_service = {};
+    monthlyByService.forEach(r => {
+      if (!context.monthly_by_service[r.service_name]) context.monthly_by_service[r.service_name] = [];
+      context.monthly_by_service[r.service_name].push({ month: r.revenue_month, revenue: Number(r.revenue) });
+    });
+
+    // Aggregate per service for achievements (sum overlapping targets)
+    const targetAgg = {};
+    context.targets.forEach(t => {
+      if (!targetAgg[t.service]) targetAgg[t.service] = { total: 0, count: 0, first: t.start, last: t.end };
+      targetAgg[t.service].total += t.target;
+      targetAgg[t.service].count++;
+    });
+
+    context.achievements = Object.entries(targetAgg).map(([svc, agg]) => {
+      const actual = revenueMap[svc] || 0;
+      const pct = agg.total > 0 ? Math.round((actual / agg.total) * 100) : 0;
+      return { service: svc, actual, target: agg.total, achievement_pct: pct, target_count: agg.count, start: agg.first, end: agg.last };
+    });
+    // Add services with no targets but revenue
+    context.services.forEach(s => {
+      if (!targetAgg[s.name] && revenueMap[s.name]) {
+        context.achievements.push({ service: s.name, actual: revenueMap[s.name], target: 0, achievement_pct: 0, target_count: 0, start: null, end: null });
+      }
+    });
+    // Add services with no data at all
+    context.services.forEach(s => {
+      if (!context.achievements.find(a => a.service === s.name)) {
+        context.achievements.push({ service: s.name, actual: 0, target: 0, achievement_pct: 0, target_count: 0, start: null, end: null });
+      }
     });
 
     const [monthlyTrend] = await pool.execute(
@@ -211,10 +240,18 @@ async function buildVASContext() {
       services: p.services,
     }));
 
+    // Per-service alerts (NOT global — each service evaluated individually)
     context.alerts = context.achievements.map(a => ({
       service: a.service,
       achievement: a.achievement_pct,
-      level: a.achievement_pct >= 90 ? 'on_track' : a.achievement_pct >= 50 ? 'warning' : 'critical',
+      actual: a.actual,
+      target: a.target,
+      gap: a.target > 0 ? a.target - a.actual : 0,
+      level: a.target === 0 ? 'no_target'
+        : a.achievement_pct >= 90 ? 'on_track'
+        : a.achievement_pct >= 70 ? 'warning'
+        : a.achievement_pct >= 50 ? 'behind'
+        : 'critical',
     }));
 
     const [userCount] = await pool.execute('SELECT COUNT(*) as cnt FROM users');
@@ -249,14 +286,22 @@ router.post('/chat', async (req, res) => {
     // ── Build context ──────────────────────────────────────────────────────
     const vasContext = await buildVASContext();
 
-    // Build the context string with safe formatting
-    const totalTarget = vasContext.targets.reduce((s, t) => s + t.target, 0);
+    // Build comprehensive context string
+    const totalTarget = vasContext.achievements.reduce((s, a) => s + a.target, 0);
     const totalActual = vasContext.achievements.reduce((s, a) => s + a.actual, 0);
     const overallPct = totalTarget > 0 ? Math.round((totalActual / totalTarget) * 100) : 0;
+    const totalGap = totalTarget - totalActual;
+
+    // Count alerts by severity
+    const critCount = vasContext.alerts.filter(a => a.level === 'critical').length;
+    const warnCount = vasContext.alerts.filter(a => a.level === 'warning' || a.level === 'behind').length;
+    const onTrackCount = vasContext.alerts.filter(a => a.level === 'on_track').length;
+    const noTargetCount = vasContext.alerts.filter(a => a.level === 'no_target').length;
 
     const contextStr = `
-You are the VAS AI Assistant for Ethio Telecom's Value Added Services division.
-You analyze VAS revenue data and provide insights, recommendations, and answers.
+You are the VAS AI Assistant for Ethio Telecom's Value Added Services (VAS) division.
+You have COMPLETE access to VAS revenue data and must answer ALL questions thoroughly.
+You can provide insights, analysis, recommendations, comparisons, trends, and any other analysis.
 
 CRITICAL RULES — FOLLOW EXACTLY:
 1. Use ONLY the numbers provided below. Do NOT fabricate, estimate, or recalculate.
@@ -264,40 +309,101 @@ CRITICAL RULES — FOLLOW EXACTLY:
 3. If a service has 0 revenue, say 'No revenue data available' — do NOT show percentage as 0%
 4. If target is 0, say 'Target not set' — do NOT show achievement as 0% or NaN
 5. Always show both the formatted number AND the raw ETB amount when referencing revenue
+6. ALWAYS provide a COMPLETE answer — list ALL services, ALL partners, ALL data when asked
+7. Never truncate or abbreviate — show every single service and every single partner when asked
 
-CURRENT VAS DATA SUMMARY:
-- Total Revenue: ${formatETB(vasContext.total_revenue)} (${vasContext.total_revenue.toLocaleString()} ETB)
-- Total Target: ${totalTarget > 0 ? formatETB(totalTarget) + ' (' + totalTarget.toLocaleString() + ' ETB)' : 'Not fully set for all services'}
-- Overall Achievement: ${totalTarget > 0 ? overallPct + '%' : 'N/A (targets not fully set)'}
-- Total Partners: ${vasContext.partner_count}
+══════════════════════════════════════════════════════════════════
+OVERALL VAS PERFORMANCE SUMMARY
+══════════════════════════════════════════════════════════════════
+- Total Revenue (all sources): ${formatETB(vasContext.total_revenue)} (${vasContext.total_revenue.toLocaleString()} ETB)
+- Total Target (all services): ${formatETB(totalTarget)} (${totalTarget.toLocaleString()} ETB)
+- Overall Achievement: ${overallPct}%
+- Total Revenue Gap (target - actual): ${formatETB(totalGap)}
+- Total Partners (unique, fuzzy-merged): ${vasContext.partner_count}
 - Active VAS Services: ${vasContext.services.length}
+- Users: ${vasContext.user_count}
+- Alert Summary: ${critCount} CRITICAL, ${warnCount} WARNING, ${onTrackCount} ON TRACK, ${noTargetCount} NO TARGET
 
-SERVICE PERFORMANCE (Target vs Actual):
-${vasContext.achievements.map(a => {
-  if (a.target > 0 && a.actual > 0) return `- ${a.service}: Actual ${formatETB(a.actual)} vs Target ${formatETB(a.target)} (${a.achievement_pct}% achievement)`;
-  if (a.target > 0 && a.actual === 0) return `- ${a.service}: No revenue recorded yet | Target ${formatETB(a.target)} (0% - awaiting data)`;
-  if (a.target === 0 && a.actual > 0) return `- ${a.service}: Actual ${formatETB(a.actual)} | Target not set`;
-  return `- ${a.service}: No data available (target and revenue not set)`;
+══════════════════════════════════════════════════════════════════
+DETAILED SERVICE PERFORMANCE (ALL ${vasContext.achievements.length} SERVICES)
+══════════════════════════════════════════════════════════════════
+${vasContext.achievements.sort((a, b) => b.achievement_pct - a.achievement_pct).map((a, i) => {
+  const gap = a.target > 0 ? formatETB(a.target - a.actual) : 'N/A';
+  const alertLevel = vasContext.alerts.find(al => al.service === a.service);
+  const levelEmoji = alertLevel?.level === 'critical' ? '🔴' : alertLevel?.level === 'behind' ? '🟠' : alertLevel?.level === 'warning' ? '🟡' : alertLevel?.level === 'on_track' ? '🟢' : '⚪';
+  let line = `${i + 1}. ${levelEmoji} ${a.service}`;
+  if (a.target > 0 && a.actual > 0) {
+    line += `: Revenue ${formatETB(a.actual)} | Target ${formatETB(a.target)} | Achievement ${a.achievement_pct}% | Gap ${gap}`;
+  } else if (a.target > 0 && a.actual === 0) {
+    line += `: No revenue recorded | Target ${formatETB(a.target)} | Achievement 0% | Gap ${gap}`;
+  } else if (a.target === 0 && a.actual > 0) {
+    line += `: Revenue ${formatETB(a.actual)} | Target not set`;
+  } else {
+    line += `: No data (no target and no revenue)`;
+  }
+  if (a.start && a.end) {
+    const startD = typeof a.start === 'string' ? a.start.substring(0, 10) : new Date(a.start).toISOString().substring(0, 10);
+    const endD = typeof a.end === 'string' ? a.end.substring(0, 10) : new Date(a.end).toISOString().substring(0, 10);
+    line += ` | Period: ${startD} to ${endD}`;
+  }
+  if (a.target_count > 1) line += ` (${a.target_count} target records)`;
+  return line;
 }).join('\n')}
 
-MONTHLY REVENUE TREND:
+══════════════════════════════════════════════════════════════════
+MONTHLY REVENUE BY SERVICE
+══════════════════════════════════════════════════════════════════
+${Object.keys(vasContext.monthly_by_service).length > 0 ?
+  Object.entries(vasContext.monthly_by_service).map(([svc, months]) =>
+    `${svc}:\n${months.map(m => `  ${m.month}: ${formatETB(m.revenue)}`).join('\n')}`
+  ).join('\n\n') : 'No monthly data available yet'}
+
+══════════════════════════════════════════════════════════════════
+MONTHLY REVENUE TREND (ALL SERVICES COMBINED)
+══════════════════════════════════════════════════════════════════
 ${vasContext.monthly_trend.length > 0 ? vasContext.monthly_trend.map(m => `- ${m.month}: ${formatETB(m.revenue)}`).join('\n') : '- No monthly data available yet'}
 
-TOP PARTNERS BY REVENUE:
+══════════════════════════════════════════════════════════════════
+TOP 10 PARTNERS BY REVENUE
+══════════════════════════════════════════════════════════════════
 ${vasContext.top_partners.length > 0 ? vasContext.top_partners.map((p, i) => `${i + 1}. ${p.name}: ${formatETB(p.revenue)} (services: ${p.services})`).join('\n') : '- No partner revenue data yet'}
 
-REVENUE ALERTS (alert meaning: ON_TRACK = 90%+ of target, WARNING = 50-89%, CRITICAL = below 50% of target):
-${vasContext.alerts.map(a => `- ${a.service}: ${a.level.toUpperCase().replace('_', ' ')} (${a.achievement_pct}% of target achieved)`).join('\n')}
+══════════════════════════════════════════════════════════════════
+REVENUE ALERTS (per-service assessment)
+══════════════════════════════════════════════════════════════════
+Severity levels: ON_TRACK (≥90%), WARNING (70-89%), BEHIND (50-69%), CRITICAL (<50%), NO_TARGET (no target set)
+${vasContext.alerts.sort((a, b) => a.achievement - b.achievement).map(a => {
+  const levelStr = a.level.toUpperCase().replace('_', ' ');
+  const gapStr = a.gap > 0 ? `Gap: ${formatETB(a.gap)}` : (a.target === 0 ? 'No target set' : 'On target');
+  return `- ${a.service}: ${levelStr} — ${a.achievement}% of target achieved (${gapStr})`;
+}).join('\n')}
+
+══════════════════════════════════════════════════════════════════
+REVENUE TARGETS BY SERVICE (with date periods)
+══════════════════════════════════════════════════════════════════
+${vasContext.targets.map(t => {
+  const startD = typeof t.start === 'string' ? t.start.substring(0, 10) : new Date(t.start).toISOString().substring(0, 10);
+  const endD = typeof t.end === 'string' ? t.end.substring(0, 10) : new Date(t.end).toISOString().substring(0, 10);
+  return `- ${t.service}: ${formatETB(t.target)} (${t.period || 'annual'}) from ${startD} to ${endD}`;
+}).join('\n')}
+
+══════════════════════════════════════════════════════════════════
+ALL VAS SERVICES (including those with no data)
+══════════════════════════════════════════════════════════════════
+${vasContext.services.map(s => `- ${s.name}`).join('\n')}
 
 INSTRUCTIONS:
-- Answer questions about VAS revenue, services, partners, targets, and alerts
+- Answer questions about VAS revenue, services, partners, targets, alerts, and trends
 - Use ONLY the exact numbers from this context — never fabricate data
-- When a service has no revenue, acknowledge it has no data yet
+- When asked about ALL services, list ALL of them — do not skip or truncate
+- When asked about partners, list ALL top 10 partners with full details
+- When asked about monthly trends, show ALL months with revenue for EACH service
 - CRITICAL alert means the service is below 50% of its target — NOT that the target is missing
 - Be concise, professional, and data-driven
 - If asked about something not in this data, say so honestly
 - Always format currency properly (e.g., ETB 1.63B not 1628048738)
 - When asked about underperforming services, show each service's achievement percentage and the gap between actual and target
+- When asked for recommendations, base them on the actual data — suggest specific actions for specific underperforming services
 `;
 
     // ── Key rotation with retry ────────────────────────────────────────────
@@ -329,7 +435,7 @@ INSTRUCTIONS:
             ...chatHistory,
           ],
           generationConfig: {
-            maxOutputTokens: 2048,
+            maxOutputTokens: 8192,
             temperature: 0.7,
             topP: 0.9,
           },

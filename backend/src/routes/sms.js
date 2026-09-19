@@ -1,14 +1,28 @@
 const express = require('express');
 const router = express.Router();
 const pool = require('../config/database');
+const { MESSAGE_MODULES, memberOfSectionSql, allowedSectionsFor } = require('../utils/sectionMembership');
 
 // GET active users with phone numbers (for SMS recipient selection)
+// Only returns users in the caller's allowed sections — plus anyone who can
+// switch into those sections and holds a messaging permission there, so people
+// working in both sections are reachable from either one.
 router.get('/users', async (req, res) => {
   try {
-    const [rows] = await pool.execute(
-      `SELECT id, full_name, email, phone, department, status
-       FROM users WHERE status = 'active' AND phone IS NOT NULL AND phone != '' ORDER BY full_name`
-    );
+    const allowedSections = await allowedSectionsFor(req.user?.id, req.user?.section || null, MESSAGE_MODULES);
+
+    let query = `SELECT u.id, u.full_name, u.email, u.phone, u.department, u.status
+       FROM users u WHERE u.status = 'active' AND u.phone IS NOT NULL AND u.phone != ''`;
+    const params = [];
+
+    if (allowedSections) {
+      const membership = memberOfSectionSql('u', allowedSections, MESSAGE_MODULES);
+      query += ` AND ${membership.sql}`;
+      params.push(...membership.params);
+    }
+
+    query += ' ORDER BY u.full_name';
+    const [rows] = await pool.execute(query, params);
     res.json(rows);
   } catch (error) {
     res.status(500).json({ error: error.message });
