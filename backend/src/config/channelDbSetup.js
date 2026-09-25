@@ -177,6 +177,22 @@ const STATEMENTS = [
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     KEY idx_channel_err_batch (batch_id)
   )`,
+
+  // ── Manager photos, keyed by TIN ──────────────────────────────────────────
+  // Fetched from eTrade's Registration API during TIN verification (the
+  // company manager's passport photo) or uploaded by hand to replace it. Keyed
+  // by TIN rather than entity id so every record sharing a TIN — and a TIN
+  // re-verified later — resolves to the same official photo.
+  `CREATE TABLE IF NOT EXISTS channel_manager_photos (
+    tin VARCHAR(20) PRIMARY KEY,
+    photo MEDIUMBLOB NOT NULL,
+    content_type VARCHAR(50) NOT NULL DEFAULT 'image/jpeg',
+    source ENUM('etrade','upload') NOT NULL DEFAULT 'etrade',
+    manager_name VARCHAR(150) NULL,
+    manager_name_eng VARCHAR(150) NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+  )`,
 ];
 
 /**

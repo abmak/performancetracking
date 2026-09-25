@@ -310,11 +310,11 @@ export default function ChannelBatchImport() {
           {[
             {
               name: 'Distributor', level: 1, tone: 'text-indigo-800', border: 'border-indigo-200',
-              cols: ['Distributor Name', 'Existing Business', 'Distributor Mobile Number', 'Distributor Status', 'Distributor Region', 'Air Time Type'],
+              cols: ['Distributor Name', 'Distributor Mobile Number', 'Distributor Status', 'Distributor Region', 'Air Time Type'],
             },
             {
               name: 'Sub-Distributor', level: 2, tone: 'text-cyan-800', border: 'border-cyan-200',
-              cols: ['Sub Distributor Name', 'Existing Business', 'Sub Distributor Mobile Number', 'Sub Distributor Status', 'Geographical Domain', 'Distributor Name', 'Distributor Region', 'Distributor Contact', 'Air Time Type'],
+              cols: ['Sub Distributor Name', 'Sub Distributor Mobile Number', 'Sub Distributor Status', 'Distributor Name', 'Distributor Region', 'Distributor Contact', 'Air Time Type'],
             },
             {
               name: 'Retailer', level: 3, tone: 'text-emerald-800', border: 'border-emerald-200',
@@ -344,10 +344,12 @@ export default function ChannelBatchImport() {
           ))}
         </div>
         <p className="text-[10px] text-blue-600 mt-3">
-          Column headings are matched loosely, so the common source spellings (Retalier exsting business, Distributer Region,
+          Column headings are matched loosely, so the common source spellings (Distributer Region,
           Sub distributer contact) all work. The Retailer sheet also accepts <strong>Retailer TIN</strong>,
           <strong>Retailer Location</strong> and <strong>Retailer National/Fayda ID</strong> — all optional, and the only
-          columns that are. A Distributor or Sub-Distributor that a row names but the registry has not seen
+          columns that are. The Distributor and Sub-Distributor sheets carry no Existing Business column, and the
+          Sub-Distributor sheet no Geographical Domain either — a Sub-Distributor has no territory of its own.
+          A Distributor or Sub-Distributor that a row names but the registry has not seen
           yet is created from that row's own name, contact and region, so one retailer file can build the whole chain.
         </p>
       </div>

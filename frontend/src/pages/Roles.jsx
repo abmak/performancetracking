@@ -299,6 +299,7 @@ export default function Roles() {
     channel_dashboard: '📊 Channel Dashboard',
     channel_import: '📤 Channel Import',
     channel_reports: '📋 Channel Reports',
+    channel_entities: '🗂️ Channel Data (Edit / Delete)',
     channel_users: '👤 Channel Users',
     channel_roles: '🛡️ Channel Roles',
     channel_audit: '📜 Channel Audit Trail',

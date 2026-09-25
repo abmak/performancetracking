@@ -82,3 +82,17 @@ export const CATEGORY_OPTIONS = [
   { value: 'enterprise', label: 'Enterprise' },
   { value: 'other', label: 'Other' },
 ];
+
+/**
+ * Read an image File as the bare base64 payload of its data URL (no
+ * `data:...;base64,` prefix) — the shape the manager-photo upload endpoint
+ * expects in its JSON body.
+ */
+export function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result).split(',')[1] || '');
+    reader.onerror = () => reject(new Error('Could not read the selected file'));
+    reader.readAsDataURL(file);
+  });
+}

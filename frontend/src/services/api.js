@@ -380,8 +380,20 @@ export const channelAPI = {
   getEntity: (id) => request(`/channel/entities/${id}`),
   lookupEntity: (mobile) => request(`/channel/entities/lookup?mobile=${encodeURIComponent(mobile)}`),
   verifyTin: (tin) => request(`/channel/tin-verify/${encodeURIComponent(tin)}`),
+  // Preview-only verify for the edit/consent flow: the official photo is NOT
+  // stored until the user explicitly consents to replacing it.
+  verifyTinPreview: (tin) => request(`/channel/tin-verify/${encodeURIComponent(tin)}?store_photo=0`),
   verifyEntityTin: (id, data) => request(`/channel/entities/${id}/verify-tin`, { method: 'POST', body: data }),
   batchVerifyTins: (data) => request('/channel/tin-verify/batch', { method: 'POST', body: data }),
+  // Records a batch run could touch — feeds the batch modal's record picker.
+  batchVerifyCandidates: (params) => {
+    const qs = new URLSearchParams(params).toString();
+    return request(`/channel/tin-verify/candidates?${qs}`);
+  },
+  // Manager photo upload: { tin, photo_base64, content_type? } — JSON, since
+  // the photo arrives from a FileReader as base64 (no multipart needed).
+  uploadPhoto: (data) => request('/channel/photo', { method: 'POST', body: data }),
+  getPhotoMeta: (tin) => request(`/channel/photo/${encodeURIComponent(tin)}/meta`),
   // Closed lists for the registration form's upline pickers (level 1 or 2),
   // each entry carrying enough profile to fill the form in from the selection.
   getEntityOptions: (params) => {

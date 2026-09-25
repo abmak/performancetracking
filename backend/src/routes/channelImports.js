@@ -25,6 +25,7 @@ const crypto = require('crypto');
 
 const pool = require('../config/database');
 const { invalidate } = require('../utils/endpointCache');
+const { relinkHierarchy } = require('./channelHierarchy');
 const { isMasterAdmin } = require('../middleware/permissions');
 const {
   ensureChannelSchema,
@@ -192,8 +193,12 @@ const LEVEL_LAYOUTS = [
     username: ['subdistributorname', 'subdistributername'],
     mobile: ['subdistributormobilenumber', 'subdistributormobile', 'subdistributermobile', 'subdistributorcontact', 'mobilenumber', 'mobile'],
     status: ['subdistributorstatus', 'status', 'userstatus'],
-    geo: ['geographicaldomain', 'geographicdomain', 'subdistributorregion', 'region', 'geo'],
-    businessType: ['existingbusiness', 'businesstype', 'business'],
+    // Geographical Domain removed from the Sub-Distributor sheet: a
+    // Sub-Distributor has no territory of its own in the IDC model — the area
+    // the retailers under it trade in is already on each Retailer row.
+    geo: [],
+    // Existing Business removed from the Sub-Distributor sheet.
+    businessType: [],
     parentName: ['distributorname', 'distributername'],
     parentMobile: ['distributorcontact', 'distributorcontac', 'distributercontact', 'distributormobile', 'distributermobile'],
     ownerName: ['distributorname', 'distributername'],
@@ -211,7 +216,8 @@ const LEVEL_LAYOUTS = [
     mobile: ['distributormobilenumber', 'distributormobile', 'distributermobile', 'distributorcontact', 'mobilenumber', 'mobile'],
     status: ['distributorstatus', 'status', 'userstatus'],
     geo: ['distributorregion', 'distributerregion', 'geographicaldomain', 'region', 'geo'],
-    businessType: ['existingbusiness', 'businesstype', 'business'],
+    // Existing Business removed from the Distributor sheet.
+    businessType: [],
     parentName: [],
     parentMobile: [],
     ownerName: [],
@@ -243,6 +249,21 @@ function pickIndex(byKey, names) {
   return undefined;
 }
 
+/**
+ * Fuzzy-find a TIN column the alias list missed: split each header into words
+ * and accept one that names a TIN ("Retailer TIN", "Tax ID No.", "tin_number")
+ * — word boundaries keep ordinary words like "Sorting" or "Testing" from
+ * matching a naive substring check.
+ */
+function fuzzyTinIndex(headerRow) {
+  return (headerRow || []).findIndex((h) => {
+    const words = String(h || '').toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+    return words.some((w) =>
+      w === 'tin' || w.startsWith('tin') || w === 'tax'
+      || w.startsWith('taxid') || w.startsWith('taxidentification'));
+  });
+}
+
 function buildColumnMap(headerRow) {
   const byKey = {};
   (headerRow || []).forEach((h, i) => {
@@ -259,6 +280,17 @@ function buildColumnMap(headerRow) {
       const idx = pickIndex(byKey, layout[field]);
       if (idx !== undefined) map[field] = idx;
     }
+    // Fallback: a TIN column the alias list doesn't recognise. After the
+    // named aliases miss, accept a word-boundary TIN/Tax header — so a file
+    // headed "Tax ID No." or "TIN of Retailer" still imports its TINs
+    // instead of silently dropping them.
+    if (map.tin === undefined) {
+      const fuzzy = fuzzyTinIndex(headerRow);
+      if (fuzzy !== -1) {
+        map.tin = fuzzy;
+        map.tinFuzzy = true;
+      }
+    }
     return { map, byKey, layout };
   }
 
@@ -267,6 +299,13 @@ function buildColumnMap(headerRow) {
   for (const [field, names] of Object.entries(COLUMN_ALIASES)) {
     const idx = pickIndex(byKey, names);
     if (idx !== undefined) map[field] = idx;
+  }
+  if (map.tin === undefined) {
+    const fuzzy = fuzzyTinIndex(headerRow);
+    if (fuzzy !== -1) {
+      map.tin = fuzzy;
+      map.tinFuzzy = true;
+    }
   }
   return { map, byKey, layout: null };
 }
@@ -467,9 +506,11 @@ function parseWorkbook(buffer, lookups) {
         });
       };
       // A Distributor sits at the top of the chain, so a missing upline is
-      // expected there rather than flagged.
+      // expected there rather than flagged. A Sub-Distributor carries no
+      // territory of its own, so its missing geographical domain is expected
+      // too — the areas its retailers trade in live on the Retailer rows.
       const expectsUpline = sheetLevel === null || sheetLevel > 1;
-      if (!record.geo) warn('Missing geographical domain');
+      if (!record.geo && (sheetLevel === null || sheetLevel > 2)) warn('Missing geographical domain');
       if (expectsUpline && !record.parent_mobile) warn('Missing parent (upline) mobile');
       if (expectsUpline && !record.owner_mobile) warn('Missing owner (distributor) mobile');
 
@@ -546,23 +587,23 @@ function buildTemplateWorkbook(cats = []) {
 
     addSheet(
       'Distributor',
-      ['Distributor Name', 'Existing Business', 'Distributor Mobile Number', 'Distributor Status',
+      ['Distributor Name', 'Distributor Mobile Number', 'Distributor Status',
         'Distributor Region', 'Air Time Type'],
       [
-        ['Ebyan Communication', 'Open Market', '985693664', 'Active', 'EER', 'EVD'],
-        ['Bisrat Melaku General Trading', 'Open Market', '911674451', 'Active', 'SR', 'EVD'],
-        ['Bereket Tsegaye', 'Open Market', '919999575', 'Active', 'SSWR', 'EVD'],
+        ['Ebyan Communication', '985693664', 'Active', 'EER', 'EVD'],
+        ['Bisrat Melaku General Trading', '911674451', 'Active', 'SR', 'EVD'],
+        ['Bereket Tsegaye', '919999575', 'Active', 'SSWR', 'EVD'],
       ]
     );
 
     addSheet(
       'Sub-Distributor',
-      ['Sub Distributor Name', 'Existing Business', 'Sub Distributor Mobile Number', 'Sub Distributor Status',
-        'Geographical Domain', 'Distributor Name', 'Distributor Region', 'Distributor Contact',
+      ['Sub Distributor Name', 'Sub Distributor Mobile Number', 'Sub Distributor Status',
+        'Distributor Name', 'Distributor Region', 'Distributor Contact',
         'Air Time Type'],
       [
-        ['Nuuro Ahmed Mohamed', 'Shopes', '978649795', 'Active', 'Hargele', 'Ebyan Communication', 'EER', '985693664', 'EVD'],
-        ['Rediet Yoseph', 'super market', '911851164', 'Active', 'Hawassa', 'Bisrat Melaku General Trading', 'SR', '911674451', 'EVD'],
+        ['Nuuro Ahmed Mohamed', '978649795', 'Active', 'Ebyan Communication', 'EER', '985693664', 'EVD'],
+        ['Rediet Yoseph', '911851164', 'Active', 'Bisrat Melaku General Trading', 'SR', '911674451', 'EVD'],
       ]
     );
 
@@ -597,62 +638,16 @@ function buildTemplateWorkbook(cats = []) {
     summarySheet['!cols'] = summaryHeader.map((h) => ({ wch: Math.max(h.length + 3, 16) }));
     XLSX.utils.book_append_sheet(wb, summarySheet, 'Summary');
 
-    // ── Reference — the column contract for each level ──
-    const categories = cats.map((c) => [c.domain_code, c.name, c.level, c.code]);
-    const layoutNotes = [
-      ['Sheet', 'Column', 'Required', 'Accepted values / notes'],
-      ['Distributor', 'Distributor Name', 'Yes', 'Free text. Spaces are collapsed on import.'],
-      ['Distributor', 'Distributor Mobile Number', 'Yes', '9-digit local number, e.g. 985693664. +251… and leading-0 forms are accepted.'],
-      ['Distributor', 'Distributor Region', 'No', 'Region code or place name, e.g. EER, SR, SSWR.'],
-      ['Distributor', 'Existing Business', 'No', 'What the user runs: Open Market, Shopes, super market, …'],
-      ['Distributor', 'Distributor Status', 'No', 'Active | Canceled | Inactive. Blank defaults to Active.'],
-      [],
-      ['Sub-Distributor', 'Sub Distributor Name', 'Yes', 'The Sub-Distributor being registered.'],
-      ['Sub-Distributor', 'Sub Distributor Mobile Number', 'Yes', '9-digit local number.'],
-      ['Sub-Distributor', 'Geographical Domain', 'No', 'Place name, e.g. Hargele, Hawassa.'],
-      ['Sub-Distributor', 'Existing Business', 'No', 'What the user runs.'],
-      ['Sub-Distributor', 'Distributor Name', 'Yes', 'Must match a registered Distributor.'],
-      ['Sub-Distributor', 'Distributor Contact', 'Yes', 'That Distributor\'s mobile — this is what links the hierarchy.'],
-      ['Sub-Distributor', 'Distributor Region', 'No', 'Stored on the Distributor, not on the Sub-Distributor.'],
-      [],
-      ['Retailer', 'Retailer Name', 'Yes', 'The Retailer being registered.'],
-      ['Retailer', 'Retailer Mobile Number', 'Yes', '9-digit local number.'],
-      ['Retailer', 'Retailer Geographical Domain', 'No', 'Place name, e.g. Hargele, Kebribeyah.'],
-      ['Retailer', 'Retailer Existing Business', 'No', 'super market, Shopes, Open Market, …'],
-      ['Retailer', 'Sub Distributor Name', 'Yes', 'Immediate upline. Created automatically if not registered yet.'],
-      ['Retailer', 'Sub Distributor Contact', 'Yes', 'Immediate upline mobile — links the hierarchy.'],
-      ['Retailer', 'Distributor Name', 'Yes', 'Top of the chain. Created automatically if not registered yet.'],
-      ['Retailer', 'Distributor Contact', 'Yes', 'Top-of-chain mobile.'],
-      ['Retailer', 'Distributor Region', 'No', 'Stored on the Distributor.'],
-      ['Retailer', 'Retailer TIN', 'No', 'Optional. Tax identification number. Retailer sheets only.'],
-      ['Retailer', 'Retailer Location', 'No', 'Optional. Where the shop physically sits — town, kebele, landmark. Retailer sheets only.'],
-      ['Retailer', 'Retailer National/Fayda ID', 'No', 'Optional. National (Fayda) id. Retailer sheets only.'],
-      [],
-      ['All levels', 'Air Time Type', 'No', 'Product, e.g. EVD. Defaults to eTopUP when blank.'],
-      // Available Balance removed — balance is no longer tracked.
-      [],
-      ['Domain', 'Level', 'Category (accepted value)', 'Internal code'],
-      ...categories.map((c) => [c[0], c[2], c[1], c[3]]),
-      [],
-      ['The level is detected from the columns — there is no Category column to fill in.'],
-      ['Column headings are matched loosely, so the common source spellings (Retalier exsting business, Distributer Region, Sub distributer contact) all work.'],
-      ['Upload one, two or all three sheets in the same workbook.'],
-      ['The Summary sheet is optional; when present it is reconciled against the detail extract.'],
-      ['A sheet with a Category column instead of these layouts is still accepted (the legacy contract).'],
-    ];
-    const refSheet = XLSX.utils.aoa_to_sheet(layoutNotes);
-    refSheet['!cols'] = [{ wch: 16 }, { wch: 28 }, { wch: 10 }, { wch: 62 }];
-    XLSX.utils.book_append_sheet(wb, refSheet, 'Reference');
-
+    // No Reference sheet — the example rows on each level sheet already show
+    // the format, and the upload page documents the column contract.
     return wb;
   }
 }
 
 /**
  * Build a single-level template workbook. The operator picks one level and
- * gets a file that contains only that level's sheet plus its column contract
- * on a Reference tab — so the person filling it in is not confused by
- * columns they will never use.
+ * gets a file that contains only that level's sheet — so the person filling
+ * it in is not confused by columns they will never use.
  */
 function buildSingleLevelTemplate(level, cats = []) {
   const wb = XLSX.utils.book_new();
@@ -665,22 +660,22 @@ function buildSingleLevelTemplate(level, cats = []) {
   if (level === 1) {
     addSheet(
       'Distributor',
-      ['Distributor Name', 'Existing Business', 'Distributor Mobile Number', 'Distributor Status',
+      ['Distributor Name', 'Distributor Mobile Number', 'Distributor Status',
         'Distributor Region', 'Air Time Type'],
       [
-        ['Ebyan Communication', 'Open Market', '985693664', 'Active', 'EER', 'EVD'],
-        ['Bisrat Melaku General Trading', 'Open Market', '911674451', 'Active', 'SR', 'EVD'],
+        ['Ebyan Communication', '985693664', 'Active', 'EER', 'EVD'],
+        ['Bisrat Melaku General Trading', '911674451', 'Active', 'SR', 'EVD'],
       ]
     );
   } else if (level === 2) {
     addSheet(
       'Sub-Distributor',
-      ['Sub Distributor Name', 'Existing Business', 'Sub Distributor Mobile Number', 'Sub Distributor Status',
-        'Geographical Domain', 'Distributor Name', 'Distributor Region', 'Distributor Contact',
+      ['Sub Distributor Name', 'Sub Distributor Mobile Number', 'Sub Distributor Status',
+        'Distributor Name', 'Distributor Region', 'Distributor Contact',
         'Air Time Type'],
       [
-        ['Nuuro Ahmed Mohamed', 'Shopes', '978649795', 'Active', 'Hargele', 'Ebyan Communication', 'EER', '985693664', 'EVD'],
-        ['Rediet Yoseph', 'super market', '911851164', 'Active', 'Hawassa', 'Bisrat Melaku General Trading', 'SR', '911674451', 'EVD'],
+        ['Nuuro Ahmed Mohamed', '978649795', 'Active', 'Ebyan Communication', 'EER', '985693664', 'EVD'],
+        ['Rediet Yoseph', '911851164', 'Active', 'Bisrat Melaku General Trading', 'SR', '911674451', 'EVD'],
       ]
     );
   } else if (level === 3) {
@@ -698,53 +693,7 @@ function buildSingleLevelTemplate(level, cats = []) {
     );
   }
 
-  // Reference sheet for the chosen level only.
-  const categories = cats.map((c) => [c.domain_code, c.name, c.level, c.code]);
-  const allNotes = [
-    ['Sheet', 'Column', 'Required', 'Accepted values / notes'],
-    ['Distributor', 'Distributor Name', 'Yes', 'Free text. Spaces are collapsed on import.'],
-    ['Distributor', 'Distributor Mobile Number', 'Yes', '9-digit local number, e.g. 985693664. +251\u2026 and leading-0 forms are accepted.'],
-    ['Distributor', 'Distributor Region', 'No', 'Region code or place name, e.g. EER, SR, SSWR.'],
-    ['Distributor', 'Existing Business', 'No', 'What the user runs: Open Market, Shopes, super market, \u2026'],
-    ['Distributor', 'Distributor Status', 'No', 'Active | Canceled | Inactive. Blank defaults to Active.'],
-    [],
-    ['Sub-Distributor', 'Sub Distributor Name', 'Yes', 'The Sub-Distributor being registered.'],
-    ['Sub-Distributor', 'Sub Distributor Mobile Number', 'Yes', '9-digit local number.'],
-    ['Sub-Distributor', 'Geographical Domain', 'No', 'Place name, e.g. Hargele, Hawassa.'],
-    ['Sub-Distributor', 'Existing Business', 'No', 'What the user runs.'],
-    ['Sub-Distributor', 'Distributor Name', 'Yes', 'Must match a registered Distributor.'],
-    ['Sub-Distributor', 'Distributor Contact', 'Yes', 'That Distributor\'s mobile \u2014 this is what links the hierarchy.'],
-    ['Sub-Distributor', 'Distributor Region', 'No', 'Stored on the Distributor, not on the Sub-Distributor.'],
-    [],
-    ['Retailer', 'Retailer Name', 'Yes', 'The Retailer being registered.'],
-    ['Retailer', 'Retailer Mobile Number', 'Yes', '9-digit local number.'],
-    ['Retailer', 'Retailer Geographical Domain', 'No', 'Place name, e.g. Hargele, Kebribeyah.'],
-    ['Retailer', 'Retailer Existing Business', 'No', 'super market, Shopes, Open Market, \u2026'],
-    ['Retailer', 'Sub Distributor Name', 'Yes', 'Immediate upline. Created automatically if not registered yet.'],
-    ['Retailer', 'Sub Distributor Contact', 'Yes', 'Immediate upline mobile \u2014 links the hierarchy.'],
-    ['Retailer', 'Distributor Name', 'Yes', 'Top of the chain. Created automatically if not registered yet.'],
-    ['Retailer', 'Distributor Contact', 'Yes', 'Top-of-chain mobile.'],
-    ['Retailer', 'Distributor Region', 'No', 'Stored on the Distributor.'],
-    ['Retailer', 'Retailer TIN', 'No', 'Optional. Tax identification number. Retailer sheets only.'],
-    ['Retailer', 'Retailer Location', 'No', 'Optional. Where the shop physically sits \u2014 town, kebele, landmark. Retailer sheets only.'],
-    ['Retailer', 'Retailer National/Fayda ID', 'No', 'Optional. National (Fayda) id. Retailer sheets only.'],
-    [],
-    ['All levels', 'Air Time Type', 'No', 'Product, e.g. EVD. Defaults to eTopUP when blank.'],
-    // Available Balance removed — balance is no longer tracked.
-    [],
-    ['Domain', 'Level', 'Category (accepted value)', 'Internal code'],
-    ...categories.map((c) => [c[0], c[2], c[1], c[3]]),
-    [],
-    ['The level is detected from the columns \u2014 there is no Category column to fill in.'],
-    ['Column headings are matched loosely, so the common source spellings (Retalier exsting business, Distributer Region, Sub distributer contact) all work.'],
-  ];
-  const levelName = { 1: 'Distributor', 2: 'Sub-Distributor', 3: 'Retailer' }[level];
-  const refNotes = allNotes.filter((row) => !row.length || row[0] === levelName || row[0] === 'All levels' || row[0] === 'Domain' || row[0] === 'Column' || (row[0] === allNotes[0][0] && level === 1));
-  // When level === 1, filter logic above doesn't match the header; add it explicitly.
-  const finalNotes = level === 1 ? allNotes.filter((row) => !row.length || row[0] === 'Distributor' || row[0] === 'All levels' || row[0] === 'Domain' || row[0] === 'Sheet' || (row[0] === 'Column')) : refNotes;
-  const refSheet = XLSX.utils.aoa_to_sheet(finalNotes);
-  refSheet['!cols'] = [{ wch: 16 }, { wch: 28 }, { wch: 10 }, { wch: 62 }];
-  XLSX.utils.book_append_sheet(wb, refSheet, 'Reference');
+  // No Reference sheet — the example rows already show the format.
   return wb;
 }
 
@@ -1052,8 +1001,25 @@ router.post('/confirm', async (req, res) => {
     // 2b — the file rows are now linked, but the uplines they named (auto-
     // created Sub-Distributors / Distributors) still sit with null parent_id /
     // owner_id.  Link them so the Distributor hierarchy view and the reports
-    // show the correct child counts.
-    const uplineLinks = await resolveUplines(rows);
+    // show the correct child counts. The sub-distributor sheet's own
+    // Distributor column is passed in explicitly — it outranks votes inferred
+    // from retailer rows.
+    const uplineSheetOwners = new Map(); // sub_mobile → distributor_mobile
+    for (const r of rows) {
+      if (r.level !== 2) continue;
+      if (r.parent_mobile && r.owner_mobile && r.parent_mobile === r.owner_mobile) {
+        uplineSheetOwners.set(r.mobile, r.owner_mobile);
+      }
+    }
+    const uplineLinks = await resolveUplines(rows, uplineSheetOwners);
+
+    // 2c — full-tree repair pass. `resolveHierarchy` only sees this file's
+    // rows: a distributor deleted and re-registered between imports still
+    // holds children whose FKs point at the dead id, and the distributor's
+    // counts would read 0 forever. The relink re-attaches every row whose
+    // mobile columns name a registered user, so the tree is whole after any
+    // import, not just the rows this file carried.
+    const relink = await relinkHierarchy();
 
     // 3 — balance time series removed
     // The Available Balance column has been removed from the import file.
@@ -1102,6 +1068,7 @@ router.post('/confirm', async (req, res) => {
       hierarchy_created: uplines.created,
       hierarchy_created_mobiles: uplines.mobiles,
       hierarchy_linked: uplineLinks.linked,
+      hierarchy_relinked: relink.fixed,
       identifiers_assigned: coded,
       reconciliation,
       detail_balance_total: round2(detailTotal),
@@ -1316,10 +1283,68 @@ router.delete('/:id', async (req, res) => {
 
     await conn.query('DELETE FROM channel_import_errors WHERE batch_id = ?', [batchId]);
 
+    // The batch row itself goes BEFORE the entity pass, so the
+    // `NOT IN (SELECT id FROM channel_import_batches)` clauses below see it as
+    // already gone.
+    await conn.query('DELETE FROM channel_import_batches WHERE id = ?', [batchId]);
+
     // The users this batch still owns go with it. Ownership is `last_batch_id`:
     // once a later import has refreshed a user, deleting an older file leaves it
     // standing — and a user an earlier, surviving batch introduced is kept too,
     // because that file is still on the register.
+    //
+    // That keep-alive rule has a hole: a row kept alive by its introducing batch
+    // loses that protection when the introducing batch is deleted LATER — its
+    // references end up pointing at two dead batches, owned by nothing, and the
+    // main pass can never see it again. The dead-batch sweep after the batch
+    // row removal below closes the hole (it must run after removal so it can
+    // see which batches are truly gone).
+
+    // ── Adoption ──────────────────────────────────────────────────────────
+    // The dying batch may EXCLUSIVELY own uplines (a distributor or
+    // sub-distributor only it listed) that surviving rows still point at as
+    // parent/owner. Deleting them orphaned every kept retailer's hierarchy and
+    // made the reports read wrong — deleting one import must not damage what
+    // another import still claims. Any candidate still referenced by a row
+    // that will survive is therefore handed to the newest surviving batch.
+    // The loop walks up the chain (retailer → sub → distributor): adopting a
+    // sub can make its distributor referenced-by-a-survivor on the next pass.
+    const [[adopter]] = await conn.query(
+      'SELECT id, import_code FROM channel_import_batches ORDER BY created_at DESC LIMIT 1'
+    );
+    let adopted = 0;
+    if (adopter) {
+      for (;;) {
+        const [refs] = await conn.query(
+          `SELECT DISTINCT c.id
+             FROM channel_entities c
+             JOIN channel_entities s ON s.parent_id = c.id OR s.owner_id = c.id
+            WHERE c.last_batch_id = ?
+              AND (c.first_batch_id IS NULL
+                   OR c.first_batch_id = ?
+                   OR c.first_batch_id NOT IN (SELECT id FROM channel_import_batches))
+              AND s.id <> c.id
+              AND (s.last_batch_id IS NULL OR s.last_batch_id <> ?
+                   OR (s.first_batch_id IS NOT NULL
+                       AND s.first_batch_id IN (SELECT id FROM channel_import_batches)))`,
+          [batchId, batchId, batchId]
+        );
+        if (!refs.length) break;
+        const ids = refs.map((r) => r.id);
+        // Re-point the dying-batch ownership to the adopter; a dead
+        // first_batch_id stays for the re-point pass below.
+        await conn.query(
+          `UPDATE channel_entities
+              SET last_batch_id = ?,
+                  first_batch_id = COALESCE(NULLIF(first_batch_id, ?), ?),
+                  import_code = ?
+            WHERE id IN (${ids.map(() => '?').join(',')})`,
+          [adopter.id, batchId, adopter.id, adopter.import_code, ...ids]
+        );
+        adopted += ids.length;
+      }
+    }
+
     const entitiesDeleted = await deleteEntitiesWhere(
       conn,
       `last_batch_id = ?
@@ -1329,7 +1354,48 @@ router.delete('/:id', async (req, res) => {
       [batchId, batchId]
     );
 
-    await conn.query('DELETE FROM channel_import_batches WHERE id = ?', [batchId]);
+    // Sweep rows an earlier out-of-order delete orphaned: imported rows whose
+    // EVERY batch reference (first and last) points at batches that no longer
+    // exist. They are the "deleted the history but data still shows" ghosts —
+    // no surviving file claims them, so nothing else can ever remove them.
+    // Runs BEFORE the re-point pass below: a ghost must not be rescued into
+    // the adopter's batch, it must be deleted.
+    const swept = await deleteEntitiesWhere(
+      conn,
+      `source = 'import'
+         AND (last_batch_id IS NOT NULL OR first_batch_id IS NOT NULL)
+         AND (last_batch_id IS NULL OR last_batch_id NOT IN (SELECT id FROM (SELECT id FROM channel_import_batches) x))
+         AND (first_batch_id IS NULL OR first_batch_id NOT IN (SELECT id FROM (SELECT id FROM channel_import_batches) y))`,
+      []
+    );
+
+    // ── Re-point stale batch references on the survivors ─────────────────
+    // A row kept alive by a surviving file can still carry a first_batch_id
+    // naming a DELETED batch (introduced by file A, refreshed by file B, then
+    // A deleted): its "first imported" provenance reads blank and no future
+    // delete's bookkeeping can see it. The newest surviving batch adopts it.
+    // After the ghost sweep, so genuinely orphaned rows are deleted rather
+    // than silently re-homed.
+    if (adopter) {
+      await conn.query(
+        `UPDATE channel_entities e
+           JOIN (SELECT id FROM channel_entities
+                  WHERE source = 'import' AND first_batch_id IS NOT NULL
+                    AND first_batch_id NOT IN (SELECT id FROM (SELECT id FROM channel_import_batches) x)) d
+             ON d.id = e.id
+            SET e.first_batch_id = ?, e.import_code = ?`,
+        [adopter.id, adopter.import_code]
+      );
+      await conn.query(
+        `UPDATE channel_entities e
+           JOIN (SELECT id FROM channel_entities
+                  WHERE source = 'import' AND last_batch_id IS NOT NULL
+                    AND last_batch_id NOT IN (SELECT id FROM (SELECT id FROM channel_import_batches) y)) d
+             ON d.id = e.id
+            SET e.last_batch_id = ?, e.import_code = ?`,
+        [adopter.id, adopter.import_code]
+      );
+    }
 
     conn.release();
     invalidate('/channel');
@@ -1337,6 +1403,8 @@ router.delete('/:id', async (req, res) => {
       message: 'Batch removed',
       balances_deleted: totalBal,
       entities_deleted: entitiesDeleted,
+      ghosts_swept: swept,
+      adopted: adopted,
     });
   } catch (error) {
     conn.release();
@@ -1749,17 +1817,44 @@ async function resolveHierarchy(rows) {
  *   retailer.parent_mobile  → Sub-Distributor
  *   retailer.owner_mobile   → Distributor
  *
- * Each Sub-Distributor's parent is its Distributor (level 1 upline), and the
- * Distributor at the top has no parent.
+ * IMPORTANT — the ownership model this must respect: a Sub-Distributor's
+ * retailers can be OWNED by several different distributors (the IDC file shows
+ * exactly that — one sub's ten retailers name ten distributors). So a sub is
+ * linked to only ONE distributor: its plurality owner across its retailers,
+ * with the sub-distributor sheet's explicit Distributor column outranking the
+ * vote. The OTHER distributors still own their individual retailers file-exact
+ * — the distributor's "Sub-Distributors I work through" count reads the
+ * distinct parents of the retailers it owns, so nobody drops to 0 from this
+ * single-link limitation.
  */
-async function resolveUplines(rows) {
-  // Sub-Distributor → Distributor mapping, derived from every retailer row.
-  const linkPairs = new Map(); // sub_dist_mobile → distributor_mobile
+async function resolveUplines(rows, uplineSheetOwners) {
+  // Sub-Distributor → Distributor votes, one per retailer row.
+  const votes = new Map(); // sub_dist_mobile → Map(distributor_mobile → count)
   for (const r of rows) {
     if (!r.level || r.level < 3 || !r.parent_mobile || !r.owner_mobile) continue;
     // The owner_mobile is the distributor; the parent_mobile is the sub-distributor.
     if (r.parent_mobile === r.owner_mobile) continue; // direct children, no sub-dist link
-    linkPairs.set(r.parent_mobile, r.owner_mobile);
+    if (!votes.has(r.parent_mobile)) votes.set(r.parent_mobile, new Map());
+    const tally = votes.get(r.parent_mobile);
+    tally.set(r.owner_mobile, (tally.get(r.owner_mobile) || 0) + 1);
+  }
+
+  const linkPairs = new Map(); // sub_dist_mobile → distributor_mobile (plurality)
+  for (const [subMobile, tally] of votes) {
+    let best = null;
+    let bestN = -1;
+    for (const [distMobile, n] of tally) {
+      if (n > bestN) { best = distMobile; bestN = n; }
+    }
+    // The sub sheet's explicit Distributor column outranks the inferred vote.
+    const sheetOwner = uplineSheetOwners?.get(subMobile);
+    if (sheetOwner) best = sheetOwner;
+    if (best) linkPairs.set(subMobile, best);
+  }
+  // Subs named by the sheet but absent from the votes (no retailer rows in
+  // this file) still get their explicit owner.
+  for (const [subMobile, distMobile] of uplineSheetOwners || []) {
+    if (!linkPairs.has(subMobile) && distMobile) linkPairs.set(subMobile, distMobile);
   }
   if (!linkPairs.size) return { linked: 0 };
 

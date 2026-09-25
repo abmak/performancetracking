@@ -9,6 +9,7 @@
     "db:setup": "node src/config/dbSetup.js",
     "db:admin-perms": "node src/config/ensureAdminPermissions.js",
     "db:chat-perms": "node src/config/addChatPermissions.js",
+    "db:channel-edit-perms": "node src/config/addChannelEditPermissions.js",
     "db:multi-section-scope": "node src/config/addMultiSectionScope.js"
   },
   "dependencies": {

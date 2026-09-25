@@ -10,8 +10,26 @@ const https = require('https');
 
 const pool = require('../config/database');
 const { getCached, setCached, invalidate } = require('../utils/endpointCache');
-const { isMasterAdmin } = require('../middleware/permissions');
+const { isMasterAdmin, requirePermission } = require('../middleware/permissions');
 const { ensureChannelSchema, assignIdentifierCodes } = require('../config/channelDbSetup');
+const { relinkHierarchy } = require('./channelHierarchy');
+
+/**
+ * Edit / delete of registered channel data is gated by the section-specific
+ * permissions the role editor shows under "Channel Data" (module
+ * channel_entities). The master admin bypasses them: their GLOBAL-scope role is
+ * granted every permission by ensureAdminPermissions, but a fresh install or a
+ * hand-rolled Admin role should never be locked out of the register.
+ */
+function requireChannelDataEdit(req, res, next) {
+  if (isMasterAdmin(req)) return next();
+  return requirePermission('channel_entities.edit')(req, res, next);
+}
+
+function requireChannelDataDelete(req, res, next) {
+  if (isMasterAdmin(req)) return next();
+  return requirePermission('channel_entities.delete')(req, res, next);
+}
 
 /**
  * Fetch data from eTrade API with timeout and HTTPS handling.
@@ -24,6 +42,9 @@ function fetchEtradeJson(path) {
       headers: {
         Accept: 'application/json, text/plain, */*',
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) TargetTracking/1.0',
+        // eTrade's Registration API checks these — a bare request can be refused.
+        Referer: 'https://etrade.gov.et/',
+        Origin: 'https://etrade.gov.et',
       },
     }, (res) => {
       let data = '';
@@ -43,6 +64,70 @@ function fetchEtradeJson(path) {
       resolve({ status: 504, error: 'Request timeout from eTrade' });
     });
   });
+}
+
+/**
+ * Fetch the company manager's photo from eTrade's Registration API.
+ *
+ * GET /api/Registration/GetRegistrationInfoByTin/{tin}/am returns the full
+ * business registration; `AssociateShortInfos[]` carries each associate's
+ * name and `Photo` — a base64-encoded JPEG. A TIN can list several
+ * associates (shareholders included), so the first one that actually carries
+ * a photo wins.
+ *
+ * Resolves null on any failure — a missing photo must never fail a TIN verify.
+ */
+async function fetchManagerPhoto(tin) {
+  try {
+    const res = await fetchEtradeJson(
+      `api/Registration/GetRegistrationInfoByTin/${encodeURIComponent(tin)}/am`
+    );
+    if (!res || res.status !== 200 || !res.data) return null;
+    const associates = Array.isArray(res.data.AssociateShortInfos)
+      ? res.data.AssociateShortInfos
+      : [];
+    const withPhoto = associates.find((a) => a && a.Photo && String(a.Photo).length > 100);
+    if (!withPhoto) return null;
+    const b64 = String(withPhoto.Photo).replace(/^data:[^,]+,/, '');
+    if (!/^[A-Za-z0-9+/=]+$/.test(b64.slice(0, 64))) return null; // sanity: looks like base64
+    return {
+      photoBase64: b64,
+      contentType: 'image/jpeg',
+      managerName: (withPhoto.ManagerName || '').trim().slice(0, 150) || null,
+      managerNameEng: (withPhoto.ManagerNameEng || '').trim().slice(0, 150) || null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Persist a manager photo against its TIN. An operator upload overrides the
+ * eTrade original, and a later re-verify of the same TIN never clobbers a
+ * custom upload back to the eTrade copy.
+ */
+async function storeManagerPhoto(tin, { photoBase64, contentType = 'image/jpeg', source, managerName = null, managerNameEng = null, force = false }) {
+  const buf = Buffer.from(String(photoBase64).replace(/^data:[^,]+,/, ''), 'base64');
+  if (!buf.length) return false;
+  const [existing] = await pool.query('SELECT source FROM channel_manager_photos WHERE tin = ?', [tin]);
+  // An operator's custom upload is only replaced when the operator themself
+  // consents (force) — a routine eTrade re-verify never clobbers it.
+  if (existing.length && existing[0].source === 'upload' && source === 'etrade' && !force) {
+    return false;
+  }
+  await pool.query(
+    `INSERT INTO channel_manager_photos (tin, photo, content_type, source, manager_name, manager_name_eng)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE
+       photo = VALUES(photo),
+       content_type = VALUES(content_type),
+       source = VALUES(source),
+       manager_name = COALESCE(VALUES(manager_name), manager_name),
+       manager_name_eng = COALESCE(VALUES(manager_name_eng), manager_name_eng),
+       updated_at = CURRENT_TIMESTAMP`,
+    [tin, buf, contentType, source, managerName, managerNameEng]
+  );
+  return true;
 }
 
 // ── Access guard ───────────────────────────────────────────────────────────
@@ -811,10 +896,36 @@ router.get('/reports/level', async (req, res) => {
       params.push(like, like, like, like);
     }
     if (parentId) {
-      // A Retailer's upline is its Sub-Distributor; anything else hangs off its
-      // Distributor.
-      where.push(level === 3 ? 'e.parent_id = ?' : 'e.owner_id = ?');
-      params.push(Number(parentId));
+      // A Retailer's direct upline is always its Sub-Distributor (parent_id).
+      // For Sub-Distributors we accept either link: auto-created uplines from a
+      // retailer-only import have parent_id = distributor_id AND owner_id =
+      // distributor_id (set by resolveUplines), while subs registered on a
+      // separate Sub-Distributor sheet may only have owner_id set. Matching both
+      // columns ensures none are silently omitted.
+      if (level === 3) {
+        where.push('e.parent_id = ?');
+        params.push(Number(parentId));
+      } else if (level === 2) {
+        // Descending from a Distributor: show a Sub-Distributor when it is
+        // filed under the distributor (either link) OR when the distributor
+        // owns retailers that this sub serves — the same ownership-aware rule
+        // the "Sub-Dists" count (subs_through) uses, so the drill-down can
+        // never disagree with the number the row displayed. A sub's retailers
+        // may be owned by several distributors, so the filed link alone
+        // misses every other distributor that works through the sub.
+        const pid = Number(parentId);
+        where.push(
+          `(e.parent_id = ? OR e.owner_id = ?
+             OR EXISTS (SELECT 1 FROM channel_entities r
+                          JOIN channel_categories rc ON rc.id = r.category_id
+                         WHERE r.parent_id = e.id AND r.owner_id = ?
+                           AND r.id <> e.id AND rc.level = 3))`
+        );
+        params.push(pid, pid, pid);
+      } else {
+        where.push('(e.parent_id = ? OR e.owner_id = ?)');
+        params.push(Number(parentId), Number(parentId));
+      }
     }
     const whereSql = where.join(' AND ');
 
@@ -879,13 +990,37 @@ router.get('/reports/level', async (req, res) => {
                 COALESCE(b.available_balance, 0) AS balance,
                 DATE_FORMAT(b.period_month, '%Y-%m-%d') AS balance_period,
                 b.entity_id IS NOT NULL AS has_balance,
+                /* sub_distributors: count level-2 children via EITHER link.
+                   Auto-created sub-distributors from a retailer-only import have
+                   parent_id = distributor AND owner_id = distributor (resolveUplines
+                   writes both). A sub registered on its own sheet may only have
+                   owner_id set.  COUNT(DISTINCT) prevents double-counting the
+                   rows where both columns point here. */
+                (SELECT COUNT(DISTINCT ch.id) FROM channel_entities ch
+                   JOIN channel_categories cc ON cc.id = ch.category_id
+                  WHERE (ch.parent_id = e.id OR ch.owner_id = e.id)
+                    AND ch.id <> e.id AND cc.level = 2) AS sub_distributors,
+                /* retailers: a retailer's top-of-chain owner is the Distributor
+                   (owner_id).  For a Distributor row, count via owner_id. */
                 (SELECT COUNT(*) FROM channel_entities ch
                    JOIN channel_categories cc ON cc.id = ch.category_id
-                  WHERE ch.owner_id = e.id AND ch.id <> e.id AND cc.level = 2) AS sub_distributors,
+                  WHERE ch.owner_id = e.id AND ch.id <> e.id AND cc.level = 3) AS retailers,
+                /* retailers_direct: retailers whose immediate upline is THIS row
+                   (via parent_id).  For a Sub-Distributor, parent_id is the link
+                   that the import writes — owner_id points to the Distributor, not
+                   the Sub-Distributor — so this is the correct count for level 2. */
                 (SELECT COUNT(*) FROM channel_entities ch
                    JOIN channel_categories cc ON cc.id = ch.category_id
-                  WHERE ${level === 2 ? 'ch.parent_id = e.id' : 'ch.owner_id = e.id'}
-                    AND ch.id <> e.id AND cc.level = 3) AS retailers,
+                  WHERE ch.parent_id = e.id AND ch.id <> e.id AND cc.level = 3) AS retailers_direct,
+                /* Subs a distributor effectively works through: the distinct
+                   Sub-Distributors of the retailers the distributor OWNS. A
+                   sub's retailers can be owned by several distributors, so
+                   counting subs whose owner_id = e.id would read 0 for every
+                   distributor except the one the sub itself was filed under. */
+                (SELECT COUNT(DISTINCT ch.parent_id) FROM channel_entities ch
+                   JOIN channel_categories cc ON cc.id = ch.category_id
+                  WHERE ch.owner_id = e.id AND ch.id <> e.id AND cc.level = 3
+                    AND ch.parent_id IS NOT NULL) AS subs_through,
                 (SELECT COUNT(*) FROM channel_entities ch
                   WHERE ch.parent_id = e.id AND ch.id <> e.id) AS direct_children,
                 (SELECT COALESCE(SUM(cb.available_balance), 0)
@@ -910,6 +1045,27 @@ router.get('/reports/level', async (req, res) => {
       // Restore the page's ranking, which the detail query does not preserve.
       const rank = new Map(ids.map((id, i) => [id, i]));
       rows = detail.sort((a, b) => rank.get(a.id) - rank.get(b.id));
+
+      // Which of the page's TINs already carry a stored manager photo — one
+      // query and a Set lookup, instead of a request (or a correlated
+      // subquery) per row. Normalized the same way storeManagerPhoto keys
+      // the photo table: digits only, zero-padded to 10.
+      const normTin = (t) => {
+        const d = String(t || '').replace(/\D/g, '');
+        return d.length >= 8 ? d.padStart(10, '0') : null;
+      };
+      const pageTins = [...new Set(rows.map((r) => normTin(r.tin)).filter(Boolean))];
+      if (pageTins.length) {
+        const [photoRows] = await pool.query(
+          `SELECT tin FROM channel_manager_photos WHERE tin IN (${pageTins.map(() => '?').join(',')})`,
+          pageTins
+        );
+        const photoTins = new Set(photoRows.map((r) => r.tin));
+        for (const r of rows) {
+          const t = normTin(r.tin);
+          r.has_photo = Boolean(t && photoTins.has(t));
+        }
+      }
     }
 
     const s = summaryRows[0] || {};
@@ -950,7 +1106,16 @@ router.get('/reports/level', async (req, res) => {
         total_balance: round2(Number(r.balance) + Number(r.downstream_balance)),
         has_balance: Boolean(r.has_balance),
         sub_distributors: Number(r.sub_distributors) || 0,
-        retailers: Number(r.retailers) || 0,
+        // "Sub-Distributors I work through" — for a distributor this is the
+        // distinct subs of the retailers it owns (a sub can serve several
+        // distributors); for a sub-distributor it is meaningless and stays 0.
+        subs_through: level === 1 ? (Number(r.subs_through) || 0) : 0,
+        // For a Distributor (level 1): retailers owned (owner_id).
+        // For a Sub-Distributor (level 2): retailers parented (parent_id) —
+        // owner_id on a retailer row points to the Distributor, not the Sub.
+        retailers: level === 2
+          ? (Number(r.retailers_direct) || 0)
+          : (Number(r.retailers) || 0),
         direct_children: Number(r.direct_children) || 0,
       })),
       pagination: { page, limit, total, pages: Math.ceil(total / limit) },
@@ -1277,11 +1442,19 @@ router.get('/entities/:id', async (req, res) => {
     const [rows] = await pool.query(
       `SELECT e.*, c.code AS category_code, c.name AS category_label, c.level,
               d.code AS domain_code, d.name AS domain_name,
-              p.user_name AS parent_name, o.user_name AS owner_name,
+              p.user_name AS parent_name, p.mobile_number AS parent_mobile,
+              o.user_name AS owner_name, o.mobile_number AS owner_mobile,
               DATE_FORMAT(e.imported_at, '%Y-%m-%d %H:%i') AS imported_at,
               ib.filename AS import_filename,
               DATE_FORMAT(ib.created_at, '%Y-%m-%d %H:%i') AS import_run_at,
-              fb.import_code AS first_import_code
+              fb.import_code AS first_import_code,
+              /* DATE_FORMAT the seen dates like every other endpoint: raw
+                 mysql2 Dates serialize to UTC ISO strings that read as the
+                 previous day in UTC+3 (2026-09-01 became 2026-08-31T21:00Z
+                 on the detail modal). Later columns win in mysql2, so these
+                 override the raw e.* values of the same name. */
+              DATE_FORMAT(e.first_seen_period, '%Y-%m-%d') AS first_seen_period,
+              DATE_FORMAT(e.last_seen_period, '%Y-%m-%d') AS last_seen_period
          FROM channel_entities e
          JOIN channel_categories c ON c.id = e.category_id
          JOIN channel_domains d ON d.id = c.domain_id
@@ -1303,11 +1476,37 @@ router.get('/entities/:id', async (req, res) => {
               (SELECT available_balance FROM channel_stock_balances cb WHERE cb.entity_id = e.id ORDER BY period_month DESC LIMIT 1) AS latest_balance
          FROM channel_entities e JOIN channel_categories c ON c.id = e.category_id
         WHERE e.parent_id = ? OR e.owner_id = ?
+           OR (c.level = 2 AND EXISTS (SELECT 1 FROM channel_entities r
+                                          JOIN channel_categories rc ON rc.id = r.category_id
+                                         WHERE r.parent_id = e.id AND r.owner_id = ?
+                                           AND r.id <> e.id AND rc.level = 3))
         ORDER BY c.level, e.user_name LIMIT 300`,
-      [req.params.id, req.params.id]
+      [req.params.id, req.params.id, req.params.id]
     );
 
-    res.json({ entity: rows[0], balance_history: history, children });
+    // A Sub-Distributor can serve SEVERAL Distributors — the registry files
+    // him under one, but his retailers' owners tell the whole story (Abdiaziz
+    // Omer Nuur serves retailers owned by three different distributors).
+    // Return every Distributor reached through his retailers so the detail
+    // views can list them all instead of the single filed link.
+    const [distrRows] = await pool.query(
+      `SELECT o.id, o.user_name, o.mobile_number, COUNT(*) AS retailers
+         FROM channel_entities r
+         JOIN channel_categories rc ON rc.id = r.category_id
+         JOIN channel_entities o ON o.id = r.owner_id
+        WHERE r.parent_id = ? AND r.id <> ? AND rc.level = 3
+        GROUP BY o.id, o.user_name, o.mobile_number
+        ORDER BY retailers DESC`,
+      [req.params.id, req.params.id]
+    );
+    const filedOwnerId = rows[0].owner_id != null ? Number(rows[0].owner_id) : null;
+    const distributors = distrRows.map((d) => ({
+      ...d,
+      retailers: Number(d.retailers) || 0,
+      is_filed: filedOwnerId !== null && Number(d.id) === filedOwnerId,
+    }));
+
+    res.json({ entity: rows[0], balance_history: history, children, distributors });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -1315,7 +1514,12 @@ router.get('/entities/:id', async (req, res) => {
 
 // ── GET /api/channel/tin-verify/:tin — eTrade & MoR TIN verification ────────
 
-router.get('/tin-verify/:tin', async (req, res) => {
+router.get('/tin-verify/:tin', async (req, res, next) => {
+  // Express matches /tin-verify/candidates against this route's :tin — but
+  // that word belongs to the batch picker's candidate-list endpoint declared
+  // below. A pure-word param can never be a TIN, so hand the request on to
+  // the next matching route instead of answering it here.
+  if (/^[a-z]+$/i.test(String(req.params.tin || ''))) return next();
   try {
     const rawTin = String(req.params.tin || '').trim().replace(/\D/g, '');
     if (!rawTin || rawTin.length < 8) {
@@ -1376,6 +1580,27 @@ router.get('/tin-verify/:tin', async (req, res) => {
       entry_date: item.ENTRY_DATE || null,
     };
 
+    // Company manager photo — fetched from the Registration API. Stored
+    // against the TIN so the registry detail can keep showing it later,
+    // unless the caller asked for a preview only (store_photo=0, the edit
+    // modal's consent flow — nothing replaces until the user confirms). A
+    // failed photo lookup never fails the verification itself.
+    const storePhoto = req.query.store_photo !== '0';
+    const photo = await fetchManagerPhoto(tin);
+    if (photo) {
+      payload.photo = {
+        manager_name: photo.managerName,
+        manager_name_eng: photo.managerNameEng,
+        source: 'etrade',
+        keywords: photo.managerNameEng || photo.managerName || 'eTrade registration record',
+      };
+      if (storePhoto) {
+        try {
+          payload.photo.stored = await storeManagerPhoto(tin, { ...photo, source: 'etrade' });
+        } catch { /* photo persistence is best-effort */ }
+      }
+    }
+
     res.json(payload);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -1383,10 +1608,20 @@ router.get('/tin-verify/:tin', async (req, res) => {
 });
 
 // ── POST /api/channel/entities/:id/verify-tin — single entity TIN verify & sync
+/**
+ * Verify an entity's TIN and — with the operator's per-field consent —
+ * replace what is registered with what the eTrade / MoR record says.
+ *
+ * `fields` names exactly which registered values may be overwritten:
+ *   business_name, phone, location, geo_domain, photo
+ * Omitted fields stay untouched; `overwrite: true` (legacy callers) means
+ * "all of them". The response echoes what was applied so the UI can show
+ * precisely what changed.
+ */
 router.post('/entities/:id/verify-tin', async (req, res) => {
   try {
     await ensureChannelSchema();
-    const { overwrite = false, tin: passedTin } = req.body || {};
+    const { overwrite = false, tin: passedTin, fields } = req.body || {};
     const [rows] = await pool.query('SELECT * FROM channel_entities WHERE id = ?', [req.params.id]);
     if (!rows.length) return res.status(404).json({ error: 'Channel entity not found' });
     const entity = rows[0];
@@ -1396,6 +1631,10 @@ router.post('/entities/:id/verify-tin', async (req, res) => {
       return res.status(400).json({ error: 'This record does not have a valid TIN number to verify' });
     }
     const cleanTin = targetTin.padStart(10, '0');
+
+    const apply = Array.isArray(fields) && fields.length
+      ? new Set(fields)
+      : (overwrite ? new Set(['business_name', 'phone', 'location', 'geo_domain', 'photo']) : new Set());
 
     const tinRes = await fetchEtradeJson(`api/Tin/checkTin/${encodeURIComponent(cleanTin)}`);
 
@@ -1425,61 +1664,84 @@ router.post('/entities/:id/verify-tin', async (req, res) => {
     const locationParts = [subCity, woreda, houseNo ? `House: ${houseNo}` : ''].filter(Boolean);
     const location = locationParts.join(', ');
 
-    // Update the database record
-    if (overwrite) {
+    // Photo — needed both for the consented replace and to report what the
+    // official record carries. Nothing replaces until consent is read.
+    const photo = await fetchManagerPhoto(cleanTin);
+
+    // ── Apply only the consented fields ───────────────────────────────────
+    const applied = [];
+    const sets = [];
+    const vals = [];
+    if (apply.has('business_name') && tradeName) {
+      sets.push('trade_name = ?', 'user_name = ?');
+      vals.push(tradeName, tradeName);
+      applied.push('business_name');
+    }
+    if (apply.has('phone') && mobile) {
+      const storeMobile = normalizeMobileForStore(mobile);
+      if (storeMobile) {
+        // mobile_number is UNIQUE and parent/owner links point at it, so a
+        // collision must be refused and downstream references moved along.
+        const [dup] = await pool.query(
+          'SELECT id FROM channel_entities WHERE mobile_number = ? AND id <> ?',
+          [storeMobile, entity.id]
+        );
+        if (dup.length) {
+          return res.status(409).json({
+            error: `Cannot replace the phone number — ${storeMobile} is already registered to another channel user`,
+            field: 'phone',
+          });
+        }
+        sets.push('mobile_number = ?');
+        vals.push(storeMobile);
+        await pool.query('UPDATE channel_entities SET parent_mobile = ? WHERE parent_mobile = ?', [storeMobile, entity.mobile_number]);
+        await pool.query('UPDATE channel_entities SET owner_mobile = ? WHERE owner_mobile = ?', [storeMobile, entity.mobile_number]);
+        applied.push('phone');
+      }
+    }
+    if (apply.has('location')) {
+      if (location) { sets.push('location = ?'); vals.push(location); }
+      sets.push('woreda = ?', 'sub_city = ?', 'house_no = ?');
+      vals.push(woreda, subCity, houseNo);
+      applied.push('location');
+    }
+    if (apply.has('geo_domain') && geoDomain) {
+      sets.push('geo_domain_raw = ?');
+      vals.push(geoDomain);
+      applied.push('geo_domain');
+    }
+    if (sets.length) {
       await pool.query(
-        `UPDATE channel_entities
-            SET tin = ?,
-                user_name = COALESCE(NULLIF(?, ''), user_name),
-                geo_domain_raw = COALESCE(NULLIF(?, ''), geo_domain_raw),
-                location = COALESCE(NULLIF(?, ''), location),
-                trade_name = ?,
-                woreda = ?,
-                sub_city = ?,
-                house_no = ?
-          WHERE id = ?`,
-        [
-          cleanTin,
-          tradeName,
-          geoDomain,
-          location,
-          tradeName,
-          woreda,
-          subCity,
-          houseNo,
-          req.params.id,
-        ]
-      );
-    } else {
-      await pool.query(
-        `UPDATE channel_entities
-            SET tin = ?,
-                trade_name = ?,
-                woreda = ?,
-                sub_city = ?,
-                house_no = ?,
-                location = IF(location IS NULL OR location = '', ?, location),
-                geo_domain_raw = IF(geo_domain_raw IS NULL OR geo_domain_raw = '', ?, geo_domain_raw)
-          WHERE id = ?`,
-        [
-          cleanTin,
-          tradeName,
-          woreda,
-          subCity,
-          houseNo,
-          location,
-          geoDomain,
-          req.params.id,
-        ]
+        `UPDATE channel_entities SET ${sets.join(', ')} WHERE id = ?`,
+        [...vals, entity.id]
       );
     }
+    if (apply.has('photo') && photo) {
+      // The operator explicitly consented to replacing the photo, so their
+      // custom upload gives way to the official record.
+      try {
+        await storeManagerPhoto(cleanTin, { ...photo, source: 'etrade', force: true });
+        applied.push('photo');
+      } catch { /* best-effort */ }
+    }
+
+    // The TIN itself always lands (that is the linkage being verified);
+    // everything else was governed by the consent list above.
+    await pool.query('UPDATE channel_entities SET tin = ? WHERE id = ?', [cleanTin, entity.id]);
 
     invalidate('/channel');
 
     res.json({
       success: true,
       found: true,
-      overwritten: Boolean(overwrite),
+      overwritten: applied.length > 0,
+      applied_fields: applied,
+      photo: photo ? {
+        manager_name: photo.managerName,
+        manager_name_eng: photo.managerNameEng,
+        source: 'etrade',
+        keywords: photo.managerNameEng || photo.managerName || 'eTrade registration record',
+      } : null,
       data: {
         tin: cleanTin,
         trade_name: tradeName,
@@ -1490,11 +1752,139 @@ router.post('/entities/:id/verify-tin', async (req, res) => {
         woreda,
         house_no: houseNo,
         location,
+        mobile_phone: mobile,
       },
-      message: `TIN ${cleanTin} verified with eTrade / Ministry of Revenue`,
+      message: applied.length
+        ? `TIN ${cleanTin} verified — replaced: ${applied.join(', ')}`
+        : `TIN ${cleanTin} verified — registered data left unchanged`,
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+// ── GET /api/channel/photo/:tin — manager photo for a verified TIN ─────────
+// Served as raw image bytes. The frontend fetches it with its auth header and
+// renders the blob, so this route stays inside the normal router guards.
+router.get('/photo/:tin', async (req, res) => {
+  try {
+    await ensureChannelSchema();
+    const tin = String(req.params.tin || '').trim().replace(/\D/g, '').padStart(10, '0');
+    const [rows] = await pool.query(
+      'SELECT photo, content_type, source, manager_name, manager_name_eng FROM channel_manager_photos WHERE tin = ?',
+      [tin]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'No manager photo on record for this TIN' });
+    const row = rows[0];
+    res.setHeader('Content-Type', row.content_type || 'image/jpeg');
+    res.setHeader('Cache-Control', 'private, no-cache');
+    res.setHeader('X-Manager-Photo-Source', row.source || '');
+    if (row.manager_name_eng || row.manager_name) {
+      res.setHeader('X-Manager-Name', encodeURIComponent(row.manager_name_eng || row.manager_name));
+    }
+    return res.send(row.photo);
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// ── GET /api/channel/photo/:tin/meta — photo presence + manager name ────────
+// Lets a view show "who the manager is" without pulling the image bytes.
+router.get('/photo/:tin/meta', async (req, res) => {
+  try {
+    await ensureChannelSchema();
+    const tin = String(req.params.tin || '').trim().replace(/\D/g, '').padStart(10, '0');
+    const [rows] = await pool.query(
+      'SELECT source, manager_name, manager_name_eng, updated_at FROM channel_manager_photos WHERE tin = ?',
+      [tin]
+    );
+    if (!rows.length) return res.json({ found: false, tin });
+    const row = rows[0];
+    return res.json({
+      found: true,
+      tin,
+      source: row.source,
+      manager_name: row.manager_name,
+      manager_name_eng: row.manager_name_eng,
+      updated_at: row.updated_at,
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// ── POST /api/channel/photo — attach / replace a manager photo by hand ──────
+// Body: { tin, photo_base64, content_type? }. The operator's upload overrides
+// whatever eTrade supplied, and later TIN re-verifies keep it (storeManagerPhoto
+// only lets an eTrade refresh replace an eTrade-sourced photo). Modifying
+// entity data, so it needs the channel-edit permission.
+router.post('/photo', requireChannelDataEdit, async (req, res) => {
+  try {
+    await ensureChannelSchema();
+    const { tin: rawTin, photo_base64: photoBase64, content_type: contentType } = req.body || {};
+    const tin = String(rawTin || '').trim().replace(/\D/g, '');
+    if (!tin || tin.length < 8) {
+      return res.status(400).json({ error: 'A valid TIN is required to attach a manager photo' });
+    }
+    const cleanB64 = String(photoBase64 || '').replace(/^data:[^,]+,/, '');
+    if (!cleanB64) {
+      return res.status(400).json({ error: 'photo_base64 is required' });
+    }
+    if (cleanB64.length > 7_000_000) {
+      return res.status(413).json({ error: 'Photo too large — please attach an image under ~5 MB' });
+    }
+    const type = ['image/jpeg', 'image/png', 'image/webp'].includes(contentType) ? contentType : 'image/jpeg';
+    const ok = await storeManagerPhoto(tin.padStart(10, '0'), {
+      photoBase64: cleanB64,
+      contentType: type,
+      source: 'upload',
+    });
+    if (!ok) return res.status(400).json({ error: 'Could not decode the attached photo' });
+    return res.json({ success: true, tin: tin.padStart(10, '0'), source: 'upload' });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// ── GET /api/channel/tin-verify/candidates — records a batch run could touch
+// Feeds the batch modal's record picker: every registered record with a TIN,
+// with what's on it now, so the operator can select all or a subset before
+// choosing which fields the run may replace. NOTE: declared after the
+// /tin-verify/:tin route, so it must be reachable — the :tin handler rejects
+// pure-word params to keep this path from being swallowed by it.
+router.get('/tin-verify/candidates', async (req, res) => {
+  try {
+    await ensureChannelSchema();
+    const limit = Math.min(parseInt(req.query.limit, 10) || 200, 1000);
+    const search = String(req.query.search || '').trim();
+    const params = [];
+    // Every registered record is listed, not only TIN-bearing ones: hiding
+    // the rest left the batch picker mysteriously empty whenever an import
+    // carried no TIN column. Records without a TIN come back flagged so the
+    // picker can show them disabled instead of hiding them.
+    let where = '1 = 1';
+    if (search) {
+      where += ' AND (e.user_name LIKE ? OR e.mobile_number LIKE ? OR e.tin LIKE ?)';
+      const like = `%${search}%`;
+      params.push(like, like, like);
+    }
+    const [rows] = await pool.query(
+      `SELECT e.id, e.user_name, e.mobile_number, e.tin, e.trade_name,
+              e.geo_domain_raw, e.location, c.level, c.name AS category_label,
+              (e.tin IS NOT NULL AND e.tin != '') AS has_tin,
+              mp.tin IS NOT NULL AS has_photo
+         FROM channel_entities e
+         JOIN channel_categories c ON c.id = e.category_id
+         LEFT JOIN channel_manager_photos mp
+           ON mp.tin = LPAD(REPLACE(REPLACE(e.tin, ' ', ''), '-', ''), 10, '0')
+        WHERE ${where}
+        ORDER BY has_tin DESC, e.id DESC
+        LIMIT ?`,
+      [...params, limit]
+    );
+    return res.json({ candidates: rows });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
   }
 });
 
@@ -1502,7 +1892,7 @@ router.post('/entities/:id/verify-tin', async (req, res) => {
 router.post('/tin-verify/batch', async (req, res) => {
   try {
     await ensureChannelSchema();
-    const { overwrite = false, entity_ids, limit = 100 } = req.body || {};
+    const { overwrite = false, entity_ids, limit = 100, fetch_photos = true, fields } = req.body || {};
 
     let sql = `SELECT id, tin, user_name, geo_domain_raw, location
                  FROM channel_entities
@@ -1522,9 +1912,19 @@ router.post('/tin-verify/batch', async (req, res) => {
       return res.json({ total: 0, verified: 0, failed: 0, message: 'No records with TIN found to verify' });
     }
 
+    // Same contract as the single-entity verify: `fields` names exactly which
+    // registered values the run may replace. Legacy `overwrite: true` means
+    // all of them; with neither, records are only checked against eTrade and
+    // trade/location facts fill empty slots (no replacement).
+    const consent = Array.isArray(fields) && fields.length
+      ? new Set(fields)
+      : (overwrite ? new Set(['business_name', 'phone', 'location', 'geo_domain', 'photo']) : null);
+
     const results = [];
     let verifiedCount = 0;
     let failedCount = 0;
+    let changedCount = 0;
+    let phoneSkipped = 0;
 
     for (const ent of entities) {
       const rawTin = String(ent.tin).replace(/\D/g, '');
@@ -1548,43 +1948,85 @@ router.post('/tin-verify/batch', async (req, res) => {
           const geoDomain = parishName || subCity;
           const houseNo = (item.HOUSE_NO || '').trim();
           const location = [subCity, woreda, houseNo ? `House: ${houseNo}` : ''].filter(Boolean).join(', ');
+          let officialMobile = (item.MOBILE_PHONE || item.PHONE_NO || '').trim();
+          if (officialMobile.startsWith('251')) officialMobile = '0' + officialMobile.slice(3);
 
-          if (overwrite) {
-            await pool.query(
-              `UPDATE channel_entities
-                  SET tin = ?,
-                      user_name = COALESCE(NULLIF(?, ''), user_name),
-                      geo_domain_raw = COALESCE(NULLIF(?, ''), geo_domain_raw),
-                      location = COALESCE(NULLIF(?, ''), location),
-                      trade_name = ?,
-                      woreda = ?,
-                      sub_city = ?,
-                      house_no = ?
-                WHERE id = ?`,
-              [cleanTin, tradeName, geoDomain, location, tradeName, woreda, subCity, houseNo, ent.id]
-            );
+          // Build the per-row update from the consent list.
+          const sets = ['tin = ?'];
+          const vals = [cleanTin];
+          const applied = [];
+          if (consent) {
+            if (consent.has('business_name') && tradeName) {
+              sets.push('user_name = COALESCE(NULLIF(?, \'\'), user_name)', 'trade_name = ?');
+              vals.push(tradeName, tradeName);
+              applied.push('business_name');
+            }
+            if (consent.has('location')) {
+              if (location) { sets.push('location = ?'); vals.push(location); }
+              sets.push('woreda = ?', 'sub_city = ?', 'house_no = ?');
+              vals.push(woreda, subCity, houseNo);
+              applied.push('location');
+            }
+            if (consent.has('geo_domain') && geoDomain) {
+              sets.push('geo_domain_raw = ?');
+              vals.push(geoDomain);
+              applied.push('geo_domain');
+            }
+            if (consent.has('phone') && officialMobile) {
+              const storeMobile = normalizeMobileForStore(officialMobile);
+              if (storeMobile && storeMobile !== ent.mobile_number) {
+                const [dup] = await pool.query(
+                  'SELECT id FROM channel_entities WHERE mobile_number = ? AND id <> ?',
+                  [storeMobile, ent.id]
+                );
+                if (dup.length) {
+                  // The official number belongs to another registered user —
+                  // skip the phone replace for this row, still count verified.
+                  phoneSkipped++;
+                  verifiedCount++;
+                  results.push({
+                    id: ent.id,
+                    tin: cleanTin,
+                    success: true,
+                    trade_name: tradeName,
+                    geo_domain: geoDomain,
+                    applied_fields: applied,
+                    phone_skipped: true,
+                  });
+                  continue;
+                }
+                sets.push('mobile_number = ?');
+                vals.push(storeMobile);
+                applied.push('phone');
+              }
+            }
           } else {
-            await pool.query(
-              `UPDATE channel_entities
-                  SET tin = ?,
-                      trade_name = ?,
-                      woreda = ?,
-                      sub_city = ?,
-                      house_no = ?,
-                      location = IF(location IS NULL OR location = '', ?, location),
-                      geo_domain_raw = IF(geo_domain_raw IS NULL OR geo_domain_raw = '', ?, geo_domain_raw)
-                WHERE id = ?`,
-              [cleanTin, tradeName, woreda, subCity, houseNo, location, geoDomain, ent.id]
+            // No consent list: keep the legacy "fill blanks only" behaviour.
+            sets.push(
+              'trade_name = ?',
+              'woreda = ?',
+              'sub_city = ?',
+              'house_no = ?',
+              'location = IF(location IS NULL OR location = \'\', ?, location)',
+              'geo_domain_raw = IF(geo_domain_raw IS NULL OR geo_domain_raw = \'\', ?, geo_domain_raw)'
             );
+            vals.push(tradeName, woreda, subCity, houseNo, location, geoDomain);
           }
 
+          await pool.query(
+            `UPDATE channel_entities SET ${sets.join(', ')} WHERE id = ?`,
+            [...vals, ent.id]
+          );
+
           verifiedCount++;
+          if (applied.length) changedCount++;
           results.push({
             id: ent.id,
             tin: cleanTin,
             success: true,
             trade_name: tradeName,
             geo_domain: geoDomain,
+            applied_fields: applied,
           });
         } else {
           failedCount++;
@@ -1596,13 +2038,60 @@ router.post('/tin-verify/batch', async (req, res) => {
       }
     }
 
+    // Photo consent: `photo` in the field list replaces every verified TIN's
+    // stored photo with the official one — custom uploads included, exactly
+    // like the single flow. Without consent, only TINs with no photo yet are
+    // backfilled (the existing re-run-stays-fast behaviour).
+    let photosFetched = 0;
+    if (fetch_photos) {
+      const okTins = [...new Set(results.filter((r) => r.success).map((r) => r.tin))];
+      if (okTins.length) {
+        const [have] = await pool.query(
+          `SELECT tin FROM channel_manager_photos WHERE tin IN (${okTins.map(() => '?').join(',')})`,
+          okTins
+        );
+        const stored = new Set(have.map((r) => r.tin));
+        const need = okTins.filter((t) => !stored.has(t));
+        // Consented photo replaces also refresh photos the TIN already has —
+        // force=true is what lets them override custom uploads.
+        const replace = consent?.has('photo')
+          ? okTins.filter((t) => stored.has(t))
+          : [];
+        const targets = [...need, ...replace];
+
+        let cursor = 0;
+        const worker = async () => {
+          while (cursor < targets.length) {
+            const tin = targets[cursor++];
+            const photo = await fetchManagerPhoto(tin);
+            if (!photo) continue;
+            try {
+              await storeManagerPhoto(tin, {
+                ...photo,
+                source: 'etrade',
+                force: replace.includes(tin),
+              });
+              photosFetched++;
+              for (const r of results) if (r.tin === tin) r.photo_fetched = true;
+            } catch { /* best-effort */ }
+          }
+        };
+        await Promise.all(Array.from({ length: Math.min(4, targets.length) }, worker));
+      }
+    }
+
+    // After the photos land, so the registry list's cached has_photo flags
+    // reflect what this run just fetched.
     invalidate('/channel');
 
     res.json({
       total: entities.length,
       verified: verifiedCount,
       failed: failedCount,
+      changed: changedCount,
+      phone_skipped: phoneSkipped,
       overwritten: Boolean(overwrite),
+      photos: photosFetched,
       results,
     });
   } catch (error) {
@@ -1612,7 +2101,7 @@ router.post('/tin-verify/batch', async (req, res) => {
 
 // ── POST /api/channel/entities — single registration ───────────────────────
 
-router.post('/entities', async (req, res) => {
+router.post('/entities', requireChannelDataEdit, async (req, res) => {
   try {
     await ensureChannelSchema();
     const b = req.body || {};
@@ -1688,6 +2177,12 @@ router.post('/entities', async (req, res) => {
     // shows one the moment the form closes.
     await assignIdentifierCodes();
 
+    // Repair pass: registering an upline AFTER rows that already named it by
+    // mobile is the classic way a distributor's child counts end up reading 0
+    // — the children's FKs were resolved against a registry that did not yet
+    // contain it. One relink re-attaches them now that it exists.
+    await relinkHierarchy();
+
     invalidate('/channel');
     res.status(201).json({ message: 'Channel user registered', id: result.insertId });
   } catch (error) {
@@ -1710,7 +2205,7 @@ router.post('/entities', async (req, res) => {
 
 // ── PUT /api/channel/entities/:id ──────────────────────────────────────────
 
-router.put('/entities/:id', async (req, res) => {
+router.put('/entities/:id', requireChannelDataEdit, async (req, res) => {
   try {
     await ensureChannelSchema();
     const b = req.body || {};
@@ -1727,10 +2222,35 @@ router.put('/entities/:id', async (req, res) => {
     const ownerMobile = b.owner_mobile !== undefined ? normalizeMobileForStore(b.owner_mobile) : current.owner_mobile;
     const { parentId, ownerId } = await resolveLinks(parentMobile, ownerMobile, current.id);
 
+    // The phone number is editable too. It is the entities table's UNIQUE key
+    // and the anchor for parent/owner links, so a change is guarded against
+    // collisions and every downstream reference moves with it.
+    let newMobile = current.mobile_number;
+    if (b.mobile_number !== undefined) {
+      const wanted = normalizeMobileForStore(b.mobile_number);
+      if (!wanted) {
+        return res.status(400).json({ error: 'A valid mobile number is required', field: 'mobile_number' });
+      }
+      if (wanted !== current.mobile_number) {
+        const [dup] = await pool.query(
+          'SELECT id FROM channel_entities WHERE mobile_number = ? AND id <> ?',
+          [wanted, current.id]
+        );
+        if (dup.length) {
+          return res.status(409).json({
+            error: `Mobile number ${wanted} is already registered to another channel user`,
+            field: 'mobile_number',
+          });
+        }
+        newMobile = wanted;
+      }
+    }
+
     await pool.query(
       `UPDATE channel_entities
           SET user_name = ?, category_id = ?, status = ?, geo_domain_raw = ?, product = ?,
               business_type = ?, parent_mobile = ?, owner_mobile = ?, parent_id = ?, owner_id = ?,
+              mobile_number = ?,
               tin = ?, location = ?, national_id = ?,
               woreda = ?, sub_city = ?, house_no = ?, trade_name = ?, photo_keywords = ?,
               notes = ?,
@@ -1744,6 +2264,7 @@ router.put('/entities/:id', async (req, res) => {
         b.product !== undefined ? b.product : current.product,
         b.business_type !== undefined ? b.business_type || null : current.business_type,
         parentMobile, ownerMobile, parentId, ownerId,
+        newMobile,
         b.tin !== undefined ? text(b.tin, 50) : current.tin,
         b.location !== undefined ? text(b.location, 255) : current.location,
         b.national_id !== undefined ? text(b.national_id, 50) : current.national_id,
@@ -1756,6 +2277,16 @@ router.put('/entities/:id', async (req, res) => {
         req.params.id,
       ]
     );
+
+    if (newMobile !== current.mobile_number) {
+      await pool.query('UPDATE channel_entities SET parent_mobile = ? WHERE parent_mobile = ?', [newMobile, current.mobile_number]);
+      await pool.query('UPDATE channel_entities SET owner_mobile = ? WHERE owner_mobile = ?', [newMobile, current.mobile_number]);
+    }
+
+    // Edits can move rows between uplines or change the mobile the tree is
+    // keyed on — re-run the repair so no child is left hanging off a stale
+    // link after the change.
+    await relinkHierarchy();
 
     let balanceWritten = false;
     if (b.available_balance !== undefined && b.available_balance !== '' && b.available_balance !== null) {
@@ -1783,7 +2314,7 @@ router.put('/entities/:id', async (req, res) => {
 
 // ── DELETE /api/channel/entities/:id ───────────────────────────────────────
 
-router.delete('/entities/:id', async (req, res) => {
+router.delete('/entities/:id', requireChannelDataDelete, async (req, res) => {
   try {
     await ensureChannelSchema();
     const [rows] = await pool.query('SELECT * FROM channel_entities WHERE id = ?', [req.params.id]);
@@ -1804,6 +2335,28 @@ router.delete('/entities/:id', async (req, res) => {
     await pool.query('DELETE FROM channel_entities WHERE id = ?', [req.params.id]);
     invalidate('/channel');
     res.json({ message: 'Channel entity deleted', id: Number(req.params.id) });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ── POST /api/channel/hierarchy/relink — repair the whole tree on demand ───
+/**
+ * Re-derives every row's parent_id / owner_id from its mobile columns and
+ * clears dangling ones. This is the fix for "my distributor shows 0
+ * sub-distributors but the sub-distributors exist": after a forced delete +
+ * re-register of an upline, the children still point at the dead row id — the
+ * counts read from those FKs, so they read 0 until this pass runs. Idempotent
+ * and safe to run any time; rows already correctly linked are untouched.
+ */
+router.post('/hierarchy/relink', requireChannelDataEdit, async (req, res) => {
+  try {
+    const result = await relinkHierarchy();
+    invalidate('/channel');
+    res.json({
+      message: `Hierarchy relinked — ${result.fixed} row(s) re-attached, ${result.cleared} dangling link(s) cleared, ${result.scanned} scanned`,
+      ...result,
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

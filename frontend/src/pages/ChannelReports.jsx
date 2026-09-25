@@ -1,5 +1,10 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import { useAuth } from '../context/AuthContext';
 import { channelAPI } from '../services/api';
+import { EditEntityModal, DeleteEntityModal } from '../components/channel/EntityModals';
+import ManagerPhoto from '../components/channel/ManagerPhoto';
+import { buildVerifyChoices } from '../utils/verifyChoices';
+import ColumnPicker, { loadColumnPrefs } from '../components/ColumnPicker';
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, LabelList,
   ResponsiveContainer, PieChart, Pie, Cell, ComposedChart, Area, Line,
@@ -8,8 +13,8 @@ import {
 import {
   FileBarChart, Loader2, Users, Globe, Layers,
   Building2, Store, Search, ChevronLeft, ChevronRight,
-  RefreshCw, ShieldCheck, Camera, CheckCircle2, AlertCircle, X, Sparkles,
-  Edit3, Trash2, AlertTriangle, Check, Phone, MapPin, Building, Upload,
+  RefreshCw, ShieldCheck, CheckCircle2, XCircle, AlertCircle, X, Sparkles,
+  Edit3, Trash2, AlertTriangle, Phone, MapPin, Building,
   Hash, MapPinned, Navigation, BadgeCheck, CornerDownRight,
 } from 'lucide-react';
 import toast from 'react-hot-toast';
@@ -470,14 +475,14 @@ export default function ChannelReports() {
 
               <ChartCard
                 title="Upline Coverage"
-                note="Distributors and Sub-Distributors with at least one retailer beneath them"
+                note="Of every Distributor and Sub-Distributor on the register — how many have at least one retailer directly beneath them"
                 icon={<Layers size={16} />}
               >
                 <div className="space-y-5">
                   {[
-                    ['Distributors', coverage.upline?.distributors],
-                    ['Sub-Distributors', coverage.upline?.sub_distributors],
-                  ].map(([label, d]) => {
+                    ['Distributors', coverage.upline?.distributors, 'retailers selling directly for them'],
+                    ['Sub-Distributors', coverage.upline?.sub_distributors, 'retailers reporting to them'],
+                  ].map(([label, d, tail]) => {
                     const total = Number(d?.total) || 0;
                     const covered = Number(d?.covered) || 0;
                     const share = total ? (covered / total) * 100 : 0;
@@ -490,7 +495,9 @@ export default function ChannelReports() {
                         <div className="h-2 rounded-full bg-gray-100 overflow-hidden">
                           <div className="h-full rounded-full bg-gradient-to-r from-emerald-500 to-teal-600 transition-all duration-700" style={{ width: `${share}%` }} />
                         </div>
-                        <p className="text-[10px] text-gray-400 mt-1">{fmtNum(Math.max(0, total - covered))} still with no retailer</p>
+                        <p className="text-[10px] text-gray-400 mt-1">
+                          {fmtNum(covered)} of {fmtNum(total)} {label.toLowerCase()} have {tail} · {fmtNum(Math.max(0, total - covered))} have none
+                        </p>
                       </div>
                     );
                   })}
@@ -765,8 +772,51 @@ function LevelReport({
   searchInput, setSearchInput, onSearch, onClearSearch, hasSearch,
   onVerifyEntity, onOpenBatchVerify, onEditEntity, onDeleteEntity,
 }) {
+  // Editing and deleting registered records is a grant, not a given: a role
+  // needs channel_entities.edit / channel_entities.delete (the master admin
+  // holds every permission, so the buttons simply appear for them).
+  const { hasAnyPermission } = useAuth();
+  const canEdit = hasAnyPermission('channel_entities.edit');
+  const canDelete = hasAnyPermission('channel_entities.delete');
+  const canModify = canEdit || canDelete;
   const s = data?.summary || {};
   const Icon = spec.icon;
+
+  // ── Column preferences ──
+  // The level decides which columns exist; the operator decides which of them
+  // to show. Choices persist per table in localStorage.
+  const colDefs = useMemo(() => {
+    const base = [
+      { key: 'name', label: 'Name', always: true },
+      { key: 'identifier', label: 'Identifier Code' },
+      { key: 'tin', label: 'TIN' },
+      { key: 'verify', label: 'Verify' },
+      { key: 'geo', label: 'Region / Domain' },
+      ...(spec.level === 3 ? [{ key: 'business', label: 'Business' }] : []),
+      { key: 'product', label: 'Air Time' },
+      { key: 'status', label: 'Status' },
+      ...(spec.parentColumn ? [{ key: 'parent', label: spec.parentColumn }] : []),
+      ...(spec.level === 3 ? [{ key: 'owner', label: 'Distributor' }] : []),
+      { key: 'location', label: 'Location' },
+      ...(spec.level === 1 ? [
+        { key: 'subdists', label: 'Sub-Dists' },
+        { key: 'retailers', label: 'Retailers' },
+        { key: 'children', label: 'Direct' },
+      ] : []),
+      ...(spec.level === 2 ? [{ key: 'retailers', label: 'Retailers' }] : []),
+      { key: 'imported', label: 'Imported by' },
+      ...(canModify ? [{ key: 'actions', label: 'Actions', always: true }] : []),
+    ];
+    return base;
+  }, [spec.level, spec.parentColumn, canModify]);
+  const allColKeys = useMemo(() => colDefs.map((c) => c.key), [colDefs]);
+  const storageKey = `channel_cols_${spec.level}`;
+  const [visibleCols, setVisibleCols] = useState(() => loadColumnPrefs(storageKey, allColKeys));
+  useEffect(() => {
+    setVisibleCols(loadColumnPrefs(storageKey, allColKeys));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [storageKey, allColKeys.join(',')]);
+  const show = (k) => visibleCols.has(k);
 
   return (
     <div className="space-y-6">
@@ -792,11 +842,15 @@ function LevelReport({
           note="Product carried by this level."
           rows={data?.by_product}
         />
-        <DimensionSplit
-          title="By Existing Business"
-          note="The business these users run."
-          rows={data?.by_business_type}
-        />
+        {/* Only a Retailer carries an Existing Business, so the split is
+            meaningless on the Sub-Distributor report and is not shown. */}
+        {spec.level === 3 && (
+          <DimensionSplit
+            title="By Existing Business"
+            note="The business these users run."
+            rows={data?.by_business_type}
+          />
+        )}
       </div>
 
       <div className="bg-white rounded-2xl border border-gray-200/80 shadow-sm overflow-hidden">
@@ -808,6 +862,12 @@ function LevelReport({
             </p>
           </div>
           <div className="flex items-center gap-2 flex-wrap">
+            <ColumnPicker
+              columns={colDefs}
+              visible={visibleCols}
+              setVisible={setVisibleCols}
+              storageKey={storageKey}
+            />
             <button
               onClick={onOpenBatchVerify}
               className="flex items-center gap-1.5 px-3 py-2 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white text-xs font-semibold rounded-lg shadow-sm transition"
@@ -837,19 +897,8 @@ function LevelReport({
           </div>
         </div>
 
-        {/* A retailer's record is a place with a shop, a TIN and an upline —
-            cards read far better than a fifteen-column table. The other levels
-            stay tabular because they are read as a list of numbers. */}
-        {spec.level === 3 ? (
-          <RetailerGallery
-            rows={data?.rows || []}
-            loading={loading}
-            page={page}
-            onVerifyEntity={onVerifyEntity}
-            onEditEntity={onEditEntity}
-            onDeleteEntity={onDeleteEntity}
-          />
-        ) : loading ? (
+        {/* Every level reads as a table — the retailer report included. */}
+        {loading ? (
           <div className="flex items-center justify-center h-40">
             <Loader2 size={24} className="text-blue-500 animate-spin" />
           </div>
@@ -864,31 +913,36 @@ function LevelReport({
                 <tr className="bg-gray-50 border-b border-gray-200">
                   <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600 w-10">#</th>
                   <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">{spec.title.replace(' Report', '')}</th>
-                  <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Identifier Code</th>
-                  <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">TIN & Verification</th>
-                  <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Region / Domain</th>
-                  <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Business</th>
-                  <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Air Time</th>
-                  <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Status</th>
-                  {spec.parentColumn && (
+                  {show('identifier') && <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Identifier Code</th>}
+                  {show('tin') && <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">TIN</th>}
+                  {show('verify') && <th className="px-4 py-3 text-center text-xs font-semibold text-gray-600">Verify</th>}
+                  {show('geo') && <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Region / Domain</th>}
+                  {spec.level === 3 && show('business') && <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Business</th>}
+                  {show('product') && <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Air Time</th>}
+                  {show('status') && <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Status</th>}
+                  {spec.parentColumn && show('parent') && (
                     <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">{spec.parentColumn}</th>
                   )}
-                  {spec.level === 3 && (
+                  {spec.level === 3 && show('owner') && (
                     <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Distributor</th>
                   )}
-                  <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Location</th>
-                  {spec.level === 1 && (
-                    <>
-                      <th className="px-4 py-3 text-right text-xs font-semibold text-gray-600">Sub-Dists</th>
-                      <th className="px-4 py-3 text-right text-xs font-semibold text-gray-600">Retailers</th>
-                      <th className="px-4 py-3 text-right font-semibold text-gray-900">{fmtNum(s.entities)}</th>
-                    </>
+                  {show('location') && <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Location</th>}
+                  {spec.level === 1 && show('subdists') && (
+                    <th className="px-4 py-3 text-right text-xs font-semibold text-gray-600">Sub-Dists</th>
                   )}
-                  {spec.level === 2 && (
+                  {spec.level === 1 && show('retailers') && (
                     <th className="px-4 py-3 text-right text-xs font-semibold text-gray-600">Retailers</th>
                   )}
-                  <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Imported by</th>
-                  <th className="px-4 py-3 text-center text-xs font-semibold text-gray-600 w-24">Actions</th>
+                  {spec.level === 1 && show('children') && (
+                    <th className="px-4 py-3 text-right font-semibold text-gray-900">{fmtNum(s.entities)}</th>
+                  )}
+                  {spec.level === 2 && show('retailers') && (
+                    <th className="px-4 py-3 text-right text-xs font-semibold text-gray-600">Retailers</th>
+                  )}
+                  {show('imported') && <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Imported by</th>}
+                  {canModify && show('actions') && (
+                    <th className="px-4 py-3 text-center text-xs font-semibold text-gray-600 w-24">Actions</th>
+                  )}
                 </tr>
               </thead>
               <tbody>
@@ -897,6 +951,13 @@ function LevelReport({
                     <td className="px-4 py-3 text-gray-400">{(page - 1) * PAGE_SIZE + i + 1}</td>
                     <td className="px-4 py-3">
                       <div className="flex items-center gap-2.5">
+                        {/* Manager photo from the record's TIN — a neutral image
+                            icon when there is none, so every row reads the same. */}
+                        <ManagerPhoto
+                          tin={r.has_photo ? r.tin : null}
+                          alt={r.user_name}
+                          className="w-9 h-9 rounded-full object-cover border border-gray-200 shrink-0"
+                        />
                         <div className="min-w-0 flex-1">
                           <p className="font-medium text-gray-800 max-w-[200px] truncate" title={r.user_name}>{r.user_name}</p>
                           <p className="text-xs text-gray-500 font-mono">{r.mobile_number}</p>
@@ -908,66 +969,72 @@ function LevelReport({
                         </div>
                       </div>
                     </td>
-                    <td className="px-4 py-3">
-                      <IdentifierChip code={r.identifier_code} />
-                    </td>
-                    <td className="px-4 py-3">
-                      {r.tin ? (
-                        <div className="space-y-1">
-                          <span className="font-mono text-xs text-gray-800 font-semibold block">{r.tin}</span>
-                          {r.trade_name || r.photo_keywords ? (
-                            <div className="flex items-center gap-1.5 flex-wrap">
-                              <span className="inline-flex items-center gap-1 text-[10px] font-medium text-emerald-700 bg-emerald-50 px-1.5 py-0.5 rounded border border-emerald-200">
-                                <ShieldCheck size={11} className="text-emerald-600" />
-                                Verified
-                              </span>
-                              {r.photo_keywords && (
-                                <span className="inline-flex items-center gap-0.5 text-[10px] font-medium text-blue-700 bg-blue-50 px-1.5 py-0.5 rounded border border-blue-100" title={`Photo Attached: ${r.photo_keywords}`}>
-                                  <Camera size={10} className="text-blue-600" />
-                                  Photo
-                                </span>
-                              )}
-                              <button
-                                onClick={() => onVerifyEntity(r)}
-                                className="text-gray-400 hover:text-blue-600 p-0.5 transition"
-                                title="Re-verify TIN and sync profile"
-                              >
-                                <RefreshCw size={11} />
-                              </button>
-                            </div>
-                          ) : (
-                            <button
-                              onClick={() => onVerifyEntity(r)}
-                              className="inline-flex items-center gap-1 px-2 py-0.5 bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200 rounded text-xs font-medium transition shadow-xs"
-                            >
-                              <ShieldCheck size={12} />
-                              Verify TIN
-                            </button>
-                          )}
-                        </div>
+                    {show('identifier') && (
+                      <td className="px-4 py-3">
+                        <IdentifierChip code={r.identifier_code} />
+                      </td>
+                    )}
+                    {show('tin') && (
+                      <td className="px-4 py-3">
+                        {r.tin ? (
+                          <span className="font-mono text-xs text-gray-800 font-semibold">{r.tin}</span>
+                        ) : (
+                          <span className="text-gray-300 text-xs">—</span>
+                        )}
+                      </td>
+                    )}
+                    {show('verify') && <td className="px-4 py-3 text-center">
+                      {/* Verification reads as a word, not a guess from icons:
+                          Verified when the record carries an eTrade match,
+                          Non Verified otherwise — one click to verify or re-verify. */}
+                      {/* Icons only: a green check means verified, a red X means
+                          not yet — and the X itself is the button that verifies. */}
+                      {(r.trade_name || r.photo_keywords) ? (
+                        <span className="inline-flex items-center justify-center gap-1">
+                          <CheckCircle2 size={18} className="text-emerald-500" title="Verified" />
+                          <button
+                            onClick={() => onVerifyEntity(r)}
+                            className="text-gray-400 hover:text-blue-600 p-0.5 rounded transition"
+                            title="Re-verify TIN and sync profile"
+                          >
+                            <RefreshCw size={13} />
+                          </button>
+                        </span>
                       ) : (
-                        <span className="text-gray-300 text-xs">—</span>
+                        <button
+                          onClick={() => onVerifyEntity(r)}
+                          className="p-1 text-red-500 hover:text-red-700 hover:bg-red-50 rounded-lg transition"
+                          title="Not verified — click to verify TIN against eTrade / Ministry of Revenue"
+                        >
+                          <XCircle size={18} />
+                        </button>
                       )}
-                    </td>
-                    <td className="px-4 py-3 text-gray-600 max-w-[150px] truncate" title={r.geo_domain_raw || ''}>
-                      {r.geo_domain_raw || '—'}
-                    </td>
-                    <td className="px-4 py-3 text-gray-600 max-w-[150px] truncate" title={r.business_type || ''}>{r.business_type || '—'}</td>
-                    <td className="px-4 py-3 text-gray-600">{r.product || '—'}</td>
-                    <td className="px-4 py-3">
-                      <StatusPill status={r.status} />
-                    </td>
-                    {spec.parentColumn && (
+                    </td>}
+                    {show('geo') && (
+                      <td className="px-4 py-3 text-gray-600 max-w-[150px] truncate" title={r.geo_domain_raw || ''}>
+                        {r.geo_domain_raw || '—'}
+                      </td>
+                    )}
+                    {spec.level === 3 && show('business') && (
+                      <td className="px-4 py-3 text-gray-600 max-w-[150px] truncate" title={r.business_type || ''}>{r.business_type || '—'}</td>
+                    )}
+                    {show('product') && <td className="px-4 py-3 text-gray-600">{r.product || '—'}</td>}
+                    {show('status') && (
+                      <td className="px-4 py-3">
+                        <StatusPill status={r.status} />
+                      </td>
+                    )}
+                    {spec.parentColumn && show('parent') && (
                       <td className="px-4 py-3 text-gray-600 max-w-[180px] truncate" title={r.parent_name || ''}>
                         {r.parent_name || '—'}
                       </td>
                     )}
-                    {spec.level === 3 && (
+                    {spec.level === 3 && show('owner') && (
                       <td className="px-4 py-3 text-gray-600 max-w-[180px] truncate" title={r.owner_name || ''}>
                         {r.owner_name || '—'}
                       </td>
                     )}
-                    <td className="px-4 py-3 text-gray-600 max-w-[200px]">
+                    {show('location') && <td className="px-4 py-3 text-gray-600 max-w-[200px]">
                       <span className="block truncate font-medium text-gray-700" title={r.location || ''}>
                         {r.location || '—'}
                       </span>
@@ -976,45 +1043,52 @@ function LevelReport({
                           {[r.sub_city, r.woreda, r.house_no ? `H.No ${r.house_no}` : ''].filter(Boolean).join(' · ')}
                         </span>
                       )}
-                    </td>
-                    {spec.level === 1 && (
-                      <>
-                        <td className="px-4 py-3 text-right text-gray-600">{fmtNum(r.sub_distributors)}</td>
-                        <td className="px-4 py-3 text-right text-gray-600">{fmtNum(r.retailers)}</td>
-                        <td className="px-4 py-3 text-right font-semibold text-gray-900">{fmtNum(r.direct_children)}</td>
-                      </>
+                    </td>}
+                    {spec.level === 1 && show('subdists') && (
+                      <td className="px-4 py-3 text-right text-gray-600" title="Distinct Sub-Distributors of the Retailers this Distributor owns">{fmtNum(r.subs_through ?? r.sub_distributors)}</td>
                     )}
-                    {spec.level === 2 && (
+                    {(spec.level === 1 || spec.level === 2) && show('retailers') && (
                       <td className="px-4 py-3 text-right text-gray-600">{fmtNum(r.retailers)}</td>
                     )}
-                    <td className="px-4 py-3 whitespace-nowrap">
-                      <span title={r.imported_at ? `Imported ${r.imported_at}` : undefined}>
-                        {r.import_code
-                          ? <span className="block font-mono text-xs font-medium text-blue-700">{r.import_code}</span>
-                          : <span className="text-xs text-gray-300">registered by hand</span>}
-                        {r.import_code && r.imported_at && (
-                          <span className="block text-[10px] text-gray-400">{r.imported_at}</span>
-                        )}
-                      </span>
-                    </td>
-                    <td className="px-4 py-3 text-center">
-                      <div className="flex items-center justify-center gap-1">
-                        <button
-                          onClick={() => onEditEntity(r)}
-                          className="p-1.5 text-blue-600 hover:text-blue-800 hover:bg-blue-50 rounded-lg transition"
-                          title="Edit record"
-                        >
-                          <Edit3 size={15} />
-                        </button>
-                        <button
-                          onClick={() => onDeleteEntity(r)}
-                          className="p-1.5 text-red-500 hover:text-red-700 hover:bg-red-50 rounded-lg transition"
-                          title="Delete record"
-                        >
-                          <Trash2 size={15} />
-                        </button>
-                      </div>
-                    </td>
+                    {spec.level === 1 && show('children') && (
+                      <td className="px-4 py-3 text-right font-semibold text-gray-900">{fmtNum(r.direct_children)}</td>
+                    )}
+                    {show('imported') && (
+                      <td className="px-4 py-3 whitespace-nowrap">
+                        <span title={r.imported_at ? `Imported ${r.imported_at}` : undefined}>
+                          {r.import_code
+                            ? <span className="block font-mono text-xs font-medium text-blue-700">{r.import_code}</span>
+                            : <span className="text-xs text-gray-300">registered by hand</span>}
+                          {r.import_code && r.imported_at && (
+                            <span className="block text-[10px] text-gray-400">{r.imported_at}</span>
+                          )}
+                        </span>
+                      </td>
+                    )}
+                    {canModify && show('actions') && (
+                      <td className="px-4 py-3 text-center">
+                        <div className="flex items-center justify-center gap-1">
+                          {canEdit && (
+                            <button
+                              onClick={() => onEditEntity(r)}
+                              className="p-1.5 text-blue-600 hover:text-blue-800 hover:bg-blue-50 rounded-lg transition"
+                              title="Edit record"
+                            >
+                              <Edit3 size={15} />
+                            </button>
+                          )}
+                          {canDelete && (
+                            <button
+                              onClick={() => onDeleteEntity(r)}
+                              className="p-1.5 text-red-500 hover:text-red-700 hover:bg-red-50 rounded-lg transition"
+                              title="Delete record"
+                            >
+                              <Trash2 size={15} />
+                            </button>
+                          )}
+                        </div>
+                      </td>
+                    )}
                   </tr>
                 ))}
               </tbody>
@@ -1051,704 +1125,72 @@ function LevelReport({
   );
 }
 
-/**
- * The retailer report as a board of record cards.
- *
- * A retailer is a physical shop: who runs it, where it sits, the TIN it trades
- * under and which Sub-Distributor and Distributor it sits beneath. That reads as
- * a card, and the whole list can be scanned without squinting across a table.
- */
-function RetailerGallery({ rows, loading, page, onVerifyEntity, onEditEntity, onDeleteEntity }) {
-  if (loading) {
-    return (
-      <div className="flex items-center justify-center h-40">
-        <Loader2 size={24} className="text-blue-500 animate-spin" />
-      </div>
-    );
-  }
-  if (!rows || rows.length === 0) {
-    return (
-      <div className="px-5 py-14 text-center">
-        <div className="inline-flex p-4 rounded-2xl bg-gray-50 text-gray-300 mb-3">
-          <Store size={26} />
-        </div>
-        <p className="text-sm text-gray-500">No retailer matches these filters.</p>
-      </div>
-    );
-  }
-
-  const accent = {
-    active: 'from-emerald-400 to-teal-500',
-    canceled: 'from-red-400 to-rose-500',
-    inactive: 'from-gray-300 to-gray-400',
-  };
-
-  return (
-    <div className="p-5 bg-gradient-to-b from-slate-50/80 to-white">
-      <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
-        {rows.map((r, i) => {
-          const initials = String(r.user_name || '?')
-            .trim().split(/\s+/).slice(0, 2).map(w => w[0]).join('').toUpperCase();
-          const verified = Boolean(r.trade_name || r.photo_keywords);
-          return (
-            <div
-              key={r.id}
-              className="group relative bg-white rounded-2xl border border-gray-200/80 shadow-sm hover:shadow-lg hover:-translate-y-0.5 transition-all duration-200 overflow-hidden flex flex-col"
-            >
-              <div className={'h-1.5 w-full bg-gradient-to-r ' + (accent[r.status] || accent.inactive)} />
-
-              <div className="p-4 flex-1">
-                <div className="flex items-start gap-3">
-                  <div className="w-11 h-11 rounded-xl bg-gradient-to-br from-blue-500 to-indigo-600 text-white flex items-center justify-center font-bold text-sm shadow-md shrink-0">
-                    {initials || '—'}
-                  </div>
-                  <div className="min-w-0 flex-1">
-                    <p className="font-semibold text-gray-900 text-sm leading-tight truncate" title={r.user_name}>
-                      {r.user_name}
-                    </p>
-                    <p className="text-[11px] text-gray-500 font-mono mt-0.5">{r.mobile_number}</p>
-                  </div>
-                  <span className="text-[11px] text-gray-300 font-medium tabular-nums">#{(page - 1) * PAGE_SIZE + i + 1}</span>
-                </div>
-
-                <div className="flex items-center gap-1.5 flex-wrap mt-3">
-                  <IdentifierChip code={r.identifier_code} />
-                  <StatusPill status={r.status} />
-                  {r.business_type && (
-                    <span className="inline-flex items-center px-2 py-0.5 rounded-md bg-amber-50 text-amber-700 border border-amber-100 text-[11px] font-medium">
-                      {r.business_type}
-                    </span>
-                  )}
-                  {r.product && (
-                    <span className="inline-flex items-center px-2 py-0.5 rounded-md bg-purple-50 text-purple-700 border border-purple-100 text-[11px] font-medium">
-                      {r.product}
-                    </span>
-                  )}
-                </div>
-
-                <div className="mt-3 pt-3 border-t border-dashed border-gray-100 space-y-1.5">
-                  <div className="flex items-center gap-1.5 text-[11px]">
-                    <MapPin size={11} className="text-blue-500 shrink-0" />
-                    <span className="text-gray-700 truncate" title={[r.location, r.sub_city, r.woreda, r.house_no].filter(Boolean).join(' · ')}>
-                      {r.location || r.geo_domain_raw || 'Location not recorded'}
-                    </span>
-                  </div>
-                  {(r.sub_city || r.woreda || r.house_no) && (
-                    <p className="text-[10px] text-gray-400 pl-[18px] truncate">
-                      {[r.sub_city, r.woreda, r.house_no ? `H.No ${r.house_no}` : ''].filter(Boolean).join(' · ')}
-                    </p>
-                  )}
-
-                  <div className="flex items-center gap-1.5 text-[11px]">
-                    <ShieldCheck size={11} className={verified ? 'text-emerald-500 shrink-0' : 'text-gray-300 shrink-0'} />
-                    {r.tin ? (
-                      <span className="flex items-center gap-1.5 min-w-0">
-                        <span className="font-mono text-gray-800 font-medium">{r.tin}</span>
-                        {verified ? (
-                          <span className="inline-flex items-center gap-0.5 text-[10px] font-medium text-emerald-700 bg-emerald-50 px-1.5 py-0.5 rounded border border-emerald-200">
-                            <BadgeCheck size={10} /> Verified
-                          </span>
-                        ) : (
-                          <span className="text-[10px] text-gray-400">not verified</span>
-                        )}
-                        <button
-                          onClick={() => onVerifyEntity(r)}
-                          className="text-gray-400 hover:text-blue-600 transition"
-                          title="Re-verify TIN and sync profile"
-                        >
-                          <RefreshCw size={10} />
-                        </button>
-                      </span>
-                    ) : (
-                      <button
-                        onClick={() => onVerifyEntity(r)}
-                        className="text-[10px] font-medium text-blue-600 hover:text-blue-800"
-                      >
-                        Add TIN
-                      </button>
-                    )}
-                  </div>
-                </div>
-
-                <div className="mt-3 rounded-xl bg-slate-50 border border-slate-100 px-2.5 py-2 space-y-1">
-                  <div className="flex items-center gap-1.5 text-[11px]">
-                    <CornerDownRight size={11} className="text-cyan-500 shrink-0" />
-                    <span className="text-gray-400 w-24 shrink-0">Sub-Distributor</span>
-                    <span className="text-gray-800 truncate font-medium" title={r.parent_name || ''}>{r.parent_name || '—'}</span>
-                  </div>
-                  <div className="flex items-center gap-1.5 text-[11px]">
-                    <Building2 size={11} className="text-indigo-500 shrink-0" />
-                    <span className="text-gray-400 w-24 shrink-0">Distributor</span>
-                    <span className="text-gray-800 truncate font-medium" title={r.owner_name || ''}>{r.owner_name || '—'}</span>
-                  </div>
-                </div>
-              </div>
-
-              <div className="px-4 py-2.5 border-t border-gray-100 bg-gray-50/60 flex items-center justify-between gap-2">
-                <span className="text-[10px] text-gray-400 truncate" title={r.import_code ? `Imported ${r.imported_at || ''}` : 'Registered by hand'}>
-                  {r.import_code ? `Imported · ${r.import_code}` : 'Registered by hand'}
-                </span>
-                <div className="flex items-center gap-1">
-                  <button
-                    onClick={() => onEditEntity(r)}
-                    className="p-1.5 text-blue-600 hover:text-blue-800 hover:bg-blue-50 rounded-lg transition"
-                    title="Edit record"
-                  >
-                    <Edit3 size={14} />
-                  </button>
-                  <button
-                    onClick={() => onDeleteEntity(r)}
-                    className="p-1.5 text-red-500 hover:text-red-700 hover:bg-red-50 rounded-lg transition"
-                    title="Delete record"
-                  >
-                    <Trash2 size={14} />
-                  </button>
-                </div>
-              </div>
-            </div>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
-
-/** Modal for Editing Any Entity (Distributor, Sub-Distributor, Retailer) */
-function EditEntityModal({ isOpen, onClose, entity, onUpdated }) {
-  const [form, setForm] = useState({});
-  const [loading, setLoading] = useState(false);
-  const [verifyingTin, setVerifyingTin] = useState(false);
-  const [photoUploading, setPhotoUploading] = useState(false);
-  const [photoTimestamp, setPhotoTimestamp] = useState(Date.now());
-  const photoInputRef = useRef(null);
-
-  useEffect(() => {
-    if (entity) {
-      setForm({
-        user_name: entity.user_name || '',
-        mobile_number: entity.mobile_number || '',
-        status: entity.status || 'active',
-        business_type: entity.business_type || '',
-        product: entity.product || 'EVD',
-        geo_domain_raw: entity.geo_domain_raw || '',
-        tin: entity.tin || '',
-        national_id: entity.national_id || '',
-        location: entity.location || '',
-        woreda: entity.woreda || '',
-        sub_city: entity.sub_city || '',
-        house_no: entity.house_no || '',
-        trade_name: entity.trade_name || '',
-        notes: entity.notes || '',
-      });
-      setPhotoTimestamp(Date.now());
-    }
-  }, [entity]);
-
-  if (!isOpen || !entity) return null;
-
-  async function handlePhotoUploadInModal(e) {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    if (!file.type.startsWith('image/')) {
-      toast.error('Please select an image file (JPG or PNG)');
-      return;
-    }
-    const currentTin = form.tin || entity.tin;
-    setPhotoUploading(true);
-    const fd = new FormData();
-    fd.append('photo', file);
-    if (currentTin) fd.append('tin', currentTin);
-    if (entity.id) fd.append('entity_id', entity.id);
-
-    try {
-      await channelAPI.uploadPhoto(fd);
-      toast.success('Manager photo updated successfully');
-      setPhotoTimestamp(Date.now());
-    } catch (err) {
-      toast.error('Failed to upload photo: ' + (err.message || 'Error'));
-    } finally {
-      setPhotoUploading(false);
-      if (photoInputRef.current) photoInputRef.current.value = '';
-    }
-  }
-
-  async function handleVerifyTinInModal() {
-    const raw = String(form.tin || '').trim().replace(/\D/g, '');
-    if (!raw || raw.length < 8) {
-      toast.error('Please enter a valid 10-digit TIN number');
-      return;
-    }
-    setVerifyingTin(true);
-    try {
-      const res = await channelAPI.verifyTin(raw);
-      if (res && res.found) {
-        toast.success(`TIN Verified: ${res.trade_name || raw}`);
-        setPhotoTimestamp(Date.now());
-        setForm((prev) => ({
-          ...prev,
-          trade_name: res.trade_name || prev.trade_name,
-          user_name: res.trade_name || prev.user_name,
-          geo_domain_raw: res.parish_name || res.geo_domain || prev.geo_domain_raw,
-          sub_city: res.sub_city || prev.sub_city,
-          woreda: res.woreda || prev.woreda,
-          house_no: res.house_no || prev.house_no,
-          location: res.location || prev.location,
-          tin: res.tin || raw,
-        }));
-      } else {
-        toast.error(res?.message || 'TIN not found in eTrade / Ministry of Revenue database');
-      }
-    } catch (err) {
-      toast.error('TIN Verification failed: ' + err.message);
-    } finally {
-      setVerifyingTin(false);
-    }
-  }
-
-  async function handleSubmit(e) {
-    e.preventDefault();
-    if (!form.user_name?.trim()) {
-      toast.error('Name is required');
-      return;
-    }
-    setLoading(true);
-    try {
-      await channelAPI.updateEntity(entity.id, form);
-      toast.success('Record updated successfully');
-      if (onUpdated) onUpdated();
-      onClose();
-    } catch (err) {
-      toast.error('Failed to update record: ' + err.message);
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4 animate-in fade-in overflow-y-auto">
-      <div className="bg-white rounded-2xl max-w-2xl w-full p-6 shadow-xl border border-gray-100 my-8">
-        <div className="flex items-center justify-between pb-4 border-b border-gray-100">
-          <div className="flex items-center gap-2">
-            <div className="p-2 bg-blue-50 text-blue-600 rounded-lg">
-              <Edit3 size={20} />
-            </div>
-            <div>
-              <h3 className="text-base font-bold text-gray-900">
-                Edit {entity.level === 1 ? 'Distributor' : entity.level === 2 ? 'Sub-Distributor' : 'Retailer'} Record
-              </h3>
-              <p className="text-xs text-gray-500 font-mono">Mobile: {entity.mobile_number} · ID: #{entity.id}</p>
-            </div>
-          </div>
-          <button onClick={onClose} disabled={loading} className="text-gray-400 hover:text-gray-600 p-1 rounded-lg">
-            <X size={18} />
-          </button>
-        </div>
-
-        <form onSubmit={handleSubmit} className="py-4 space-y-4 max-h-[70vh] overflow-y-auto pr-1">
-          {/* Manager Photo Card with Upload Button — retailers no longer carry a
-              photo, so the card is only offered for the upline levels. */}
-          {entity.level !== 3 && (
-          <div className="bg-gradient-to-r from-emerald-50 to-teal-50 p-3.5 rounded-xl border border-emerald-200 flex flex-col sm:flex-row items-center gap-3.5 shadow-2xs">
-            <div className="relative w-16 h-16 rounded-xl overflow-hidden bg-slate-900 border-2 border-emerald-400 shadow-sm shrink-0 flex items-center justify-center group">
-              <img
-                key={photoTimestamp}
-                src={`/api/channel/photo/${form.tin || entity.tin || 'default'}?t=${photoTimestamp}`}
-                alt={form.user_name || entity.user_name}
-                className="w-full h-full object-cover"
-              />
-              <button
-                type="button"
-                onClick={() => photoInputRef.current?.click()}
-                className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 transition-opacity flex flex-col items-center justify-center text-white text-[9px] font-medium cursor-pointer"
-                title="Click to upload custom manager photo"
-              >
-                <Camera size={14} />
-                <span>Upload</span>
-              </button>
-            </div>
-            <div className="flex-1 min-w-0 text-center sm:text-left">
-              <div className="flex items-center justify-center sm:justify-start gap-2 flex-wrap">
-                <span className="inline-flex items-center gap-1 text-[10px] font-bold text-emerald-800 bg-emerald-100 px-2 py-0.5 rounded-full border border-emerald-200">
-                  <Camera size={11} className="text-emerald-700" />
-                  Manager Photo
-                </span>
-                {entity.tin && (
-                  <span className="text-[10px] font-mono text-emerald-700 font-semibold bg-white/80 px-1.5 py-0.5 rounded border border-emerald-200">
-                    TIN: {entity.tin}
-                  </span>
-                )}
-              </div>
-              <p className="text-xs text-gray-700 font-medium mt-1 truncate">
-                {form.trade_name || form.user_name || entity.user_name}
-              </p>
-              <div className="mt-1.5 flex items-center justify-center sm:justify-start gap-2">
-                <input
-                  type="file"
-                  ref={photoInputRef}
-                  accept="image/*"
-                  className="hidden"
-                  onChange={handlePhotoUploadInModal}
-                />
-                <button
-                  type="button"
-                  onClick={() => photoInputRef.current?.click()}
-                  disabled={photoUploading}
-                  className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-semibold text-emerald-800 bg-white hover:bg-emerald-100 border border-emerald-300 rounded-lg shadow-2xs transition disabled:opacity-50 cursor-pointer"
-                >
-                  {photoUploading ? <Loader2 size={11} className="animate-spin" /> : <Upload size={11} />}
-                  {photoUploading ? 'Uploading...' : 'Upload / Change Photo'}
-                </button>
-              </div>
-            </div>
-          </div>
-          )}
-
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
-            {/* Name */}
-            <div className="sm:col-span-2">
-              <label className="block font-semibold text-gray-700 mb-1">Full / Business Name *</label>
-              <input
-                type="text"
-                value={form.user_name || ''}
-                onChange={(e) => setForm({ ...form, user_name: e.target.value })}
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500"
-                required
-              />
-            </div>
-
-            {/* TIN & Verify Button */}
-            <div className="sm:col-span-2 bg-slate-50 p-3 rounded-xl border border-slate-200">
-              <label className="block font-semibold text-gray-700 mb-1">
-                TIN (Tax Identification Number)
-              </label>
-              <div className="flex gap-2">
-                <input
-                  type="text"
-                  value={form.tin || ''}
-                  onChange={(e) => setForm({ ...form, tin: e.target.value })}
-                  placeholder="e.g. 0097598443"
-                  className="flex-1 px-3 py-2 border border-gray-300 rounded-lg text-sm font-mono bg-white focus:ring-2 focus:ring-blue-500"
-                />
-                <button
-                  type="button"
-                  onClick={handleVerifyTinInModal}
-                  disabled={verifyingTin || !form.tin?.trim()}
-                  className="flex items-center gap-1.5 px-3 py-2 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold rounded-lg shadow-xs transition disabled:opacity-50 cursor-pointer"
-                >
-                  {verifyingTin ? <Loader2 size={14} className="animate-spin" /> : <ShieldCheck size={14} />}
-                  Verify TIN
-                </button>
-              </div>
-              {form.trade_name && (
-                <p className="text-[11px] text-emerald-800 font-medium mt-1">
-                  🏢 Trade Name: {form.trade_name}
-                </p>
-              )}
-            </div>
-
-            {/* Status */}
-            <div>
-              <label className="block font-semibold text-gray-700 mb-1">Status</label>
-              <select
-                value={form.status || 'active'}
-                onChange={(e) => setForm({ ...form, status: e.target.value })}
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm bg-white focus:ring-2 focus:ring-blue-500"
-              >
-                <option value="active">Active</option>
-                <option value="canceled">Canceled</option>
-                <option value="inactive">Inactive</option>
-              </select>
-            </div>
-
-            {/* Geographical Domain */}
-            <div>
-              <label className="block font-semibold text-gray-700 mb-1">Geographical Domain / Region</label>
-              <input
-                type="text"
-                value={form.geo_domain_raw || ''}
-                onChange={(e) => setForm({ ...form, geo_domain_raw: e.target.value })}
-                placeholder="e.g. ADDIS ABABA, Hargele"
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500"
-              />
-            </div>
-
-            {/* Business Type */}
-            <div>
-              <label className="block font-semibold text-gray-700 mb-1">Existing Business</label>
-              <input
-                type="text"
-                value={form.business_type || ''}
-                onChange={(e) => setForm({ ...form, business_type: e.target.value })}
-                placeholder="e.g. Supermarket, Shop, Kiosk"
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500"
-              />
-            </div>
-
-            {/* Product */}
-            <div>
-              <label className="block font-semibold text-gray-700 mb-1">Product / Air Time</label>
-              <input
-                type="text"
-                value={form.product || ''}
-                onChange={(e) => setForm({ ...form, product: e.target.value })}
-                placeholder="e.g. EVD, eTopUP"
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500"
-              />
-            </div>
-
-            {/* Location */}
-            <div className="sm:col-span-2">
-              <label className="block font-semibold text-gray-700 mb-1">Physical Location / Address</label>
-              <input
-                type="text"
-                value={form.location || ''}
-                onChange={(e) => setForm({ ...form, location: e.target.value })}
-                placeholder="e.g. KIRKOS, WOREDA 10, House: 154"
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500"
-              />
-            </div>
-
-            {/* Sub-City, Woreda, House No */}
-            <div>
-              <label className="block font-semibold text-gray-700 mb-1">Sub-City</label>
-              <input
-                type="text"
-                value={form.sub_city || ''}
-                onChange={(e) => setForm({ ...form, sub_city: e.target.value })}
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500"
-              />
-            </div>
-
-            <div>
-              <label className="block font-semibold text-gray-700 mb-1">Woreda / Kebele</label>
-              <input
-                type="text"
-                value={form.woreda || ''}
-                onChange={(e) => setForm({ ...form, woreda: e.target.value })}
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500"
-              />
-            </div>
-
-            {/* National / Fayda ID */}
-            <div>
-              <label className="block font-semibold text-gray-700 mb-1">National / Fayda ID</label>
-              <input
-                type="text"
-                value={form.national_id || ''}
-                onChange={(e) => setForm({ ...form, national_id: e.target.value })}
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm font-mono focus:ring-2 focus:ring-blue-500"
-              />
-            </div>
-
-            <div>
-              <label className="block font-semibold text-gray-700 mb-1">House Number</label>
-              <input
-                type="text"
-                value={form.house_no || ''}
-                onChange={(e) => setForm({ ...form, house_no: e.target.value })}
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500"
-              />
-            </div>
-
-            {/* Notes */}
-            <div className="sm:col-span-2">
-              <label className="block font-semibold text-gray-700 mb-1">Notes / Remarks</label>
-              <textarea
-                rows={2}
-                value={form.notes || ''}
-                onChange={(e) => setForm({ ...form, notes: e.target.value })}
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500"
-              />
-            </div>
-          </div>
-
-          <div className="flex items-center justify-end gap-2 pt-3 border-t border-gray-100">
-            <button
-              type="button"
-              onClick={onClose}
-              disabled={loading}
-              className="px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-100 rounded-lg transition"
-            >
-              Cancel
-            </button>
-            <button
-              type="submit"
-              disabled={loading}
-              className="flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-60 rounded-lg shadow-sm transition"
-            >
-              {loading ? <Loader2 size={16} className="animate-spin" /> : <Check size={16} />}
-              {loading ? 'Saving...' : 'Save Changes'}
-            </button>
-          </div>
-        </form>
-      </div>
-    </div>
-  );
-}
-
-/** Modal for Deleting Any Entity */
-function DeleteEntityModal({ isOpen, onClose, entity, onDeleted }) {
-  const [force, setForce] = useState(false);
-  const [loading, setLoading] = useState(false);
-
-  if (!isOpen || !entity) return null;
-
-  const hasChildren = (Number(entity.sub_distributors) || 0) > 0 || (Number(entity.retailers) || 0) > 0 || (Number(entity.direct_children) || 0) > 0;
-
-  async function handleDelete() {
-    setLoading(true);
-    try {
-      await channelAPI.deleteEntity(entity.id, force);
-      toast.success('Record deleted successfully');
-      if (onDeleted) onDeleted();
-      onClose();
-    } catch (err) {
-      if (err.message?.includes('downstream')) {
-        toast.error(err.message);
-        setForce(true);
-      } else {
-        toast.error('Failed to delete: ' + err.message);
-      }
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4 animate-in fade-in">
-      <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-xl border border-gray-100">
-        <div className="flex items-center gap-3 pb-3 border-b border-gray-100">
-          <div className="p-2 bg-red-50 text-red-600 rounded-lg">
-            <AlertTriangle size={22} />
-          </div>
-          <div>
-            <h3 className="text-base font-bold text-gray-900">Delete Channel Record</h3>
-            <p className="text-xs text-gray-500">Confirm record removal from register</p>
-          </div>
-        </div>
-
-        <div className="py-4 space-y-3 text-sm">
-          <p className="text-gray-700">
-            Are you sure you want to delete <strong className="text-gray-900">{entity.user_name}</strong> ({entity.mobile_number})?
-          </p>
-
-          <div className="bg-gray-50 p-3 rounded-xl border border-gray-200 text-xs space-y-1">
-            <p><span className="text-gray-500">Level:</span> <strong className="text-gray-800">Level {entity.level || '—'}</strong></p>
-            <p><span className="text-gray-500">Geographical Domain:</span> {entity.geo_domain_raw || '—'}</p>
-            {entity.tin && <p><span className="text-gray-500">TIN:</span> <span className="font-mono text-blue-700 font-bold">{entity.tin}</span></p>}
-          </div>
-
-          {hasChildren && (
-            <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 text-xs text-amber-900 space-y-2">
-              <p className="font-semibold flex items-center gap-1">
-                <AlertCircle size={14} className="text-amber-600" />
-                Downstream Records Warning
-              </p>
-              <p>
-                This account has <strong>{entity.sub_distributors || entity.retailers || entity.direct_children}</strong> downstream records beneath it.
-              </p>
-              <label className="flex items-center gap-2 cursor-pointer pt-1 font-semibold text-amber-950 select-none">
-                <input
-                  type="checkbox"
-                  checked={force}
-                  onChange={(e) => setForce(e.target.checked)}
-                  className="rounded border-amber-300 text-red-600 focus:ring-red-500"
-                />
-                Force delete and detach downstream children
-              </label>
-            </div>
-          )}
-        </div>
-
-        <div className="flex items-center justify-end gap-2 pt-3 border-t border-gray-100">
-          <button
-            type="button"
-            onClick={onClose}
-            disabled={loading}
-            className="px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-100 rounded-lg transition"
-          >
-            Cancel
-          </button>
-          <button
-            type="button"
-            onClick={handleDelete}
-            disabled={loading}
-            className="flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-red-600 hover:bg-red-700 disabled:opacity-60 rounded-lg shadow-sm transition"
-          >
-            {loading ? <Loader2 size={16} className="animate-spin" /> : <Trash2 size={16} />}
-            {loading ? 'Deleting...' : 'Delete Record'}
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-/** Modal for verifying an individual retailer's TIN */
+/** Modal for verifying an individual retailer's TIN — shows what the official
+ *  record carries and lets the operator tick exactly which registered fields
+ *  (business name, phone, location, geo domain, photo) to replace. */
 function VerifySingleTinModal({ isOpen, onClose, entity, onVerified }) {
-  const [overwrite, setOverwrite] = useState(true);
   const [loading, setLoading] = useState(false);
-  const [result, setResult] = useState(null);
-  const [photoUploading, setPhotoUploading] = useState(false);
-  const [photoTimestamp, setPhotoTimestamp] = useState(Date.now());
-  const photoInputRef = useRef(null);
+  const [verifyRes, setVerifyRes] = useState(null);
+  const [choices, setChoices] = useState([]);
+  const [sel, setSel] = useState({});
+  const [applying, setApplying] = useState(false);
+  const [done, setDone] = useState(false);
 
   useEffect(() => {
     if (isOpen) {
-      setOverwrite(true);
-      setResult(null);
-      setPhotoTimestamp(Date.now());
+      setVerifyRes(null);
+      setChoices([]);
+      setSel({});
+      setApplying(false);
+      setDone(false);
     }
   }, [isOpen, entity]);
 
   if (!isOpen || !entity) return null;
 
-  async function handlePhotoUploadInVerify(e) {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    if (!file.type.startsWith('image/')) {
-      toast.error('Please select an image file (JPG or PNG)');
-      return;
-    }
-    const currentTin = result?.data?.tin || entity.tin;
-    setPhotoUploading(true);
-    const fd = new FormData();
-    fd.append('photo', file);
-    if (currentTin) fd.append('tin', currentTin);
-    if (entity.id) fd.append('entity_id', entity.id);
-
-    try {
-      await channelAPI.uploadPhoto(fd);
-      toast.success('Manager photo uploaded and synced');
-      setPhotoTimestamp(Date.now());
-      if (onVerified) onVerified();
-    } catch (err) {
-      toast.error('Failed to upload photo: ' + (err.message || 'Error'));
-    } finally {
-      setPhotoUploading(false);
-      if (photoInputRef.current) photoInputRef.current.value = '';
-    }
-  }
-
+  // Step 1 — fetch the official record (no registered data changes yet).
   async function handleVerify() {
     setLoading(true);
     try {
       const res = await channelAPI.verifyEntityTin(entity.id, {
-        overwrite,
+        fields: [],
         tin: entity.tin,
       });
       if (res && res.found) {
-        setResult(res);
-        setPhotoTimestamp(Date.now());
+        const list = buildVerifyChoices(entity, null, res.data ? { ...res.data, photo: res.photo } : {});
+        setVerifyRes(res);
+        setChoices(list);
+        setSel(Object.fromEntries(list.map((c) => [c.field, false])));
         toast.success(`TIN Verified: ${res.data?.trade_name || entity.tin}`);
-        if (onVerified) onVerified();
       } else {
+        setVerifyRes(null);
+        setChoices([]);
         toast.error(res?.message || 'TIN not found in eTrade / Ministry of Revenue database');
       }
     } catch (err) {
       toast.error('Verification failed: ' + err.message);
     } finally {
       setLoading(false);
+    }
+  }
+
+  // Step 2 — replace only the ticked fields on the registered record.
+  async function handleApply() {
+    const fields = choices.filter((c) => sel[c.field]).map((c) => c.field);
+    if (!fields.length) {
+      toast.error('Select at least one field to replace');
+      return;
+    }
+    setApplying(true);
+    try {
+      await channelAPI.verifyEntityTin(entity.id, { fields, tin: entity.tin });
+      toast.success(`Replaced ${fields.length} field${fields.length === 1 ? '' : 's'} from the official record`);
+      setDone(true);
+      if (onVerified) onVerified();
+    } catch (err) {
+      toast.error(err.message || 'Could not replace the selected fields');
+    } finally {
+      setApplying(false);
     }
   }
 
@@ -1786,131 +1228,95 @@ function VerifySingleTinModal({ isOpen, onClose, entity, onVerified }) {
             </div>
           </div>
 
-          {!result ? (
-            <div className="space-y-3">
-              <div className="bg-amber-50/70 border border-amber-200 rounded-xl p-3.5">
-                <label className="flex items-start gap-3 cursor-pointer select-none">
-                  <input
-                    type="checkbox"
-                    checked={overwrite}
-                    onChange={(e) => setOverwrite(e.target.checked)}
-                    disabled={loading}
-                    className="mt-0.5 h-4 w-4 text-blue-600 rounded border-gray-300 focus:ring-blue-500"
-                  />
-                  <div className="text-xs">
-                    <p className="font-semibold text-amber-900">Rewrite / overwrite existing filled information</p>
-                    <p className="text-amber-800 mt-0.5 leading-relaxed">
-                      Update this record with official government information:
-                    </p>
-                    <ul className="list-disc list-inside mt-1.5 space-y-0.5 text-amber-700">
-                      <li>Trade / Company Name &rarr; Entity Name</li>
-                      <li>Geographical Domain (populated from <strong>PARISH_NAME</strong>)</li>
-                      <li>Physical Location (Sub-City, Woreda, House No)</li>
-                      <li>Attach verified Manager Photo document metadata</li>
-                    </ul>
-                  </div>
-                </label>
+          {!verifyRes ? (
+            <div className="bg-amber-50/70 border border-amber-200 rounded-xl p-3.5 text-xs">
+              <p className="font-semibold text-amber-900">What verification checks</p>
+              <p className="text-amber-800 mt-1 leading-relaxed">
+                The official eTrade / MoR record for this TIN is fetched and compared
+                with what is registered. You then choose exactly which fields to
+                replace — nothing changes until you confirm.
+              </p>
+            </div>
+          ) : done ? (
+            <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-4 text-xs space-y-2">
+              <div className="flex items-center gap-1.5 text-emerald-800 font-bold">
+                <CheckCircle2 size={16} className="text-emerald-600" />
+                <span>Registered data replaced</span>
               </div>
+              <p className="text-emerald-900 text-[11px]">
+                The ticked fields now carry the official values. The table refreshes when you close this dialog.
+              </p>
             </div>
           ) : (
-            <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-4 text-xs space-y-3">
-              <div className="flex items-center justify-between border-b border-emerald-200 pb-2">
-                <div className="flex items-center gap-1.5 text-emerald-800 font-bold">
-                  <CheckCircle2 size={16} className="text-emerald-600" />
-                  <span>Verification Successful</span>
-                </div>
-                <span className="text-[10px] font-semibold bg-emerald-100 text-emerald-800 px-2 py-0.5 rounded-full border border-emerald-300">
-                  eTrade / MoR Synced
-                </span>
-              </div>
-
-              <div className="flex items-center gap-3 bg-white p-3 rounded-lg border border-emerald-100 shadow-xs">
-                <div className="relative w-16 h-16 rounded-lg overflow-hidden bg-slate-900 border-2 border-emerald-400 shadow-sm shrink-0 flex items-center justify-center group">
-                  <img
-                    key={photoTimestamp}
-                    src={`/api/channel/photo/${result.data?.tin || entity.tin}?t=${photoTimestamp}`}
-                    alt="Manager Photo"
-                    className="w-full h-full object-cover"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => photoInputRef.current?.click()}
-                    className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 transition-opacity flex flex-col items-center justify-center text-white text-[9px] font-medium cursor-pointer"
-                    title="Upload manager photo"
-                  >
-                    <Camera size={14} />
-                    <span>Upload</span>
-                  </button>
-                </div>
-                <div className="min-w-0 flex-1 space-y-1">
-                  <p className="font-bold text-gray-900 text-xs truncate">{result.data?.trade_name || entity.user_name}</p>
-                  <p className="text-[11px] text-emerald-700 font-semibold">{result.data?.parish_name || result.data?.geo_domain || '—'}</p>
-                  <p className="text-[10px] text-gray-500 truncate">{[result.data?.sub_city, result.data?.woreda, result.data?.house_no ? `House ${result.data?.house_no}` : ''].filter(Boolean).join(', ')}</p>
-                  
-                  <div className="flex items-center gap-2 pt-1">
+            <div className="bg-amber-50/80 border border-amber-300 rounded-xl p-3.5">
+              <p className="text-xs font-bold text-amber-900 flex items-center gap-1.5">
+                <AlertTriangle size={13} />
+                Replace registered data with the official record?
+              </p>
+              <p className="text-[11px] text-amber-800 mt-1">
+                Official record: <span className="font-semibold">{verifyRes.data?.trade_name || '—'}</span>
+              </p>
+              <div className="mt-2.5 space-y-1.5">
+                {choices.map((c) => (
+                  <label key={c.field} className="flex items-start gap-2.5 bg-white/70 border border-amber-200 rounded-lg px-2.5 py-2 cursor-pointer hover:bg-white transition">
                     <input
-                      type="file"
-                      ref={photoInputRef}
-                      accept="image/*"
-                      className="hidden"
-                      onChange={handlePhotoUploadInVerify}
+                      type="checkbox"
+                      checked={Boolean(sel[c.field])}
+                      onChange={(e) => setSel((prev) => ({ ...prev, [c.field]: e.target.checked }))}
+                      disabled={applying}
+                      className="mt-0.5 h-4 w-4 text-amber-600 rounded border-gray-300 focus:ring-amber-500"
                     />
-                    <button
-                      type="button"
-                      onClick={() => photoInputRef.current?.click()}
-                      disabled={photoUploading}
-                      className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-semibold text-emerald-800 bg-emerald-50 hover:bg-emerald-100 border border-emerald-300 rounded transition disabled:opacity-50 cursor-pointer"
-                    >
-                      {photoUploading ? <Loader2 size={10} className="animate-spin" /> : <Upload size={10} />}
-                      {photoUploading ? 'Uploading...' : 'Upload Photo'}
-                    </button>
-                    {result.data?.photo_keywords && (
-                      <span className="inline-flex items-center gap-1 text-[9px] font-medium text-blue-700 bg-blue-50 px-1.5 py-0.5 rounded">
-                        <Camera size={9} /> Doc Attached
-                      </span>
-                    )}
-                  </div>
-                </div>
-              </div>
-
-              <div className="pt-1 space-y-1 text-emerald-900 text-[11px]">
-                <p><strong className="text-emerald-800">Trade / Company:</strong> {result.data?.trade_name || '—'}</p>
-                <p><strong className="text-emerald-800">Geographical Domain (PARISH_NAME):</strong> {result.data?.parish_name || result.data?.geo_domain || '—'}</p>
-                <p><strong className="text-emerald-800">Location:</strong> {result.data?.location || '—'}</p>
+                    <div className="text-[11px] leading-snug min-w-0">
+                      <p className="font-semibold text-gray-800">{c.label}</p>
+                      <p className="text-gray-600 truncate">
+                        <span className="text-gray-400">registered:</span> {c.to || '(empty)'}
+                        {' → '}
+                        <span className="text-emerald-700 font-medium">official:</span> {c.from}
+                      </p>
+                    </div>
+                  </label>
+                ))}
+                {choices.length === 0 && (
+                  <p className="text-[11px] text-emerald-800 font-medium bg-emerald-50 border border-emerald-200 rounded-lg px-2.5 py-2">
+                    ✓ The registered data already matches the official record — nothing to replace.
+                  </p>
+                )}
               </div>
             </div>
           )}
         </div>
 
         <div className="flex items-center justify-end gap-2 pt-3 border-t border-gray-100">
-          {!result ? (
-            <>
-              <button
-                type="button"
-                onClick={onClose}
-                disabled={loading}
-                className="px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-100 rounded-lg transition"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={handleVerify}
-                disabled={loading}
-                className="flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-60 rounded-lg shadow-sm transition"
-              >
-                {loading ? <Loader2 size={16} className="animate-spin" /> : <ShieldCheck size={16} />}
-                {loading ? 'Verifying...' : 'Verify & Sync'}
-              </button>
-            </>
-          ) : (
+          {!verifyRes || done ? (
             <button
               type="button"
               onClick={onClose}
               className="px-4 py-2 text-sm font-semibold text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg transition"
             >
-              Done
+              {done ? 'Done' : 'Close'}
             </button>
+          ) : (
+            <>
+              <button
+                type="button"
+                onClick={onClose}
+                disabled={applying}
+                className="px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-100 rounded-lg transition"
+              >
+                Cancel
+              </button>
+              {choices.length > 0 && (
+                <button
+                  type="button"
+                  onClick={handleApply}
+                  disabled={applying || !Object.values(sel).some(Boolean)}
+                  className="flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-amber-600 hover:bg-amber-700 disabled:opacity-60 rounded-lg shadow-sm transition"
+                >
+                  {applying ? <Loader2 size={16} className="animate-spin" /> : <RefreshCw size={16} />}
+                  {applying ? 'Replacing...' : 'Replace Selected'}
+                </button>
+              )}
+            </>
           )}
         </div>
       </div>
@@ -1918,27 +1324,105 @@ function VerifySingleTinModal({ isOpen, onClose, entity, onVerified }) {
   );
 }
 
-/** Modal for batch verifying all imported records with TINs */
+/** Modal for batch verifying records with TINs — pick which records to check
+ *  (all, or a search-filtered subset) and tick exactly which registered fields
+ *  the run may replace. Verification itself never changes data; replacement
+ *  only happens for the consented fields. */
+const BATCH_FIELD_OPTIONS = [
+  { key: 'business_name', label: 'Business Name' },
+  { key: 'phone', label: 'Phone Number' },
+  { key: 'location', label: 'Location (Sub-City, Woreda, House No)' },
+  { key: 'geo_domain', label: 'Geographical Domain' },
+  { key: 'photo', label: 'Manager Photo (replaces custom uploads)' },
+];
+
 function BatchVerifyTinsModal({ isOpen, onClose, onVerified }) {
-  const [overwrite, setOverwrite] = useState(true);
   const [loading, setLoading] = useState(false);
   const [results, setResults] = useState(null);
+  // Record picker: the list is always visible, every listed record starts
+  // selected, and the filter narrows what "select all shown" covers.
+  const [cands, setCands] = useState(null);
+  const [candSearch, setCandSearch] = useState('');
+  const [picked, setPicked] = useState(new Set());
+  // Field consent
+  const [fields, setFields] = useState({});
+  const [candsError, setCandsError] = useState(null);
+
+  const loadCandidates = useCallback(() => {
+    setCands(null);
+    setCandsError(null);
+    channelAPI.batchVerifyCandidates({ limit: 200 })
+      .then((d) => {
+        const list = d.candidates || [];
+        setCands(list);
+        // Only TIN-bearing records start selected — the rest can't be verified.
+        setPicked(new Set(list.filter((c) => Number(c.has_tin) === 1).map((c) => c.id)));
+      })
+      .catch((err) => {
+        setCands([]);
+        setCandsError(err.message || 'Could not load the record list');
+      });
+  }, []);
 
   useEffect(() => {
     if (isOpen) {
-      setOverwrite(true);
       setResults(null);
+      setCandSearch('');
+      setPicked(new Set());
+      setFields({});
+      loadCandidates();
     }
-  }, [isOpen]);
+  }, [isOpen, loadCandidates]);
 
   if (!isOpen) return null;
+
+  const shownCands = (cands || []).filter((c) => {
+    if (!candSearch.trim()) return true;
+    const q = candSearch.toLowerCase();
+    return c.user_name?.toLowerCase().includes(q)
+      || String(c.mobile_number || '').includes(q)
+      || String(c.tin || '').includes(q);
+  });
+  // Only TIN-bearing records are selectable — the rest are listed disabled so
+  // an import without TINs is visible instead of a mysteriously empty list.
+  const pickable = shownCands.filter((c) => Number(c.has_tin) === 1);
+  const allShownPicked = pickable.length > 0 && pickable.every((c) => picked.has(c.id));
+  const anyField = Object.values(fields).some(Boolean);
+  const noTinCount = (cands || []).filter((c) => Number(c.has_tin) !== 1).length;
+  const tinCount = (cands || []).length - noTinCount;
+
+  /** Tick / untick every selectable record the filter currently shows. */
+  function toggleShown() {
+    setPicked((prev) => {
+      const next = new Set(prev);
+      if (allShownPicked) pickable.forEach((c) => next.delete(c.id));
+      else pickable.forEach((c) => next.add(c.id));
+      return next;
+    });
+  }
+
+  function toggleOne(id, checked) {
+    setPicked((prev) => {
+      const next = new Set(prev);
+      if (checked) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+  }
 
   async function handleBatchVerify() {
     setLoading(true);
     try {
-      const res = await channelAPI.batchVerifyTins({ overwrite, limit: 150 });
+      const payload = {
+        fetch_photos: true,
+        fields: Object.keys(fields).filter((k) => fields[k]),
+        entity_ids: [...picked],
+      };
+      const res = await channelAPI.batchVerifyTins(payload);
       setResults(res);
-      toast.success(`Batch verification complete: ${res.verified || 0} verified`);
+      const photoNote = res.photos ? `, ${res.photos} photo${res.photos === 1 ? '' : 's'}` : '';
+      const changeNote = res.changed ? `, ${res.changed} record${res.changed === 1 ? '' : 's'} updated` : '';
+      toast.success(`Batch verification complete: ${res.verified || 0} verified${changeNote}${photoNote}`);
       if (onVerified) onVerified();
     } catch (err) {
       toast.error('Batch verification failed: ' + err.message);
@@ -1971,32 +1455,123 @@ function BatchVerifyTinsModal({ isOpen, onClose, onVerified }) {
               <div className="bg-blue-50/70 border border-blue-200 rounded-xl p-3.5 text-xs text-blue-900 space-y-1">
                 <p className="font-semibold">Batch Verification Process</p>
                 <p className="text-blue-800 leading-relaxed">
-                  This tool scans registered channel records with TIN numbers and queries the Ethiopian eTrade & MoR API in parallel to verify tax records and retrieve trade names, administrative regions, and manager photo IDs.
+                  Registered records with TIN numbers are checked against the Ethiopian eTrade & MoR API.
+                  Choose which records to check, then tick exactly which registered fields the run may replace —
+                  nothing changes until you tick it here.
                 </p>
               </div>
 
-              <div className="bg-amber-50/70 border border-amber-200 rounded-xl p-3.5">
-                <label className="flex items-start gap-3 cursor-pointer select-none">
+              {/* ── Record picker ── */}
+              <div className="border border-gray-200 rounded-xl overflow-hidden">
+                <div className="bg-gray-50 px-3.5 py-2.5 flex items-center justify-between gap-2">
+                  <label className="flex items-center gap-2.5 cursor-pointer select-none shrink-0">
+                    <input
+                      type="checkbox"
+                      checked={allShownPicked}
+                      onChange={toggleShown}
+                      disabled={loading || !cands?.length}
+                      className="h-4 w-4 text-blue-600 rounded border-gray-300 focus:ring-blue-500"
+                    />
+                    <span className="text-xs font-semibold text-gray-800">
+                      Select all shown
+                      <span className="ml-1.5 text-[11px] font-medium text-gray-500">
+                        {cands ? `· ${picked.size} of ${cands.length} selected` : '· loading…'}
+                      </span>
+                    </span>
+                  </label>
                   <input
-                    type="checkbox"
-                    checked={overwrite}
-                    onChange={(e) => setOverwrite(e.target.checked)}
-                    disabled={loading}
-                    className="mt-0.5 h-4 w-4 text-blue-600 rounded border-gray-300 focus:ring-blue-500"
+                    type="text"
+                    value={candSearch}
+                    onChange={(e) => setCandSearch(e.target.value)}
+                    placeholder="Filter by name, phone, TIN…"
+                    className="w-44 px-2 py-1 border border-gray-300 rounded-lg text-[11px] focus:ring-2 focus:ring-blue-500"
                   />
-                  <div className="text-xs">
-                    <p className="font-semibold text-amber-900">Rewrite / overwrite existing filled information</p>
-                    <p className="text-amber-800 mt-0.5 leading-relaxed">
-                      Replace current values in the database with verified government details:
-                    </p>
-                    <ul className="list-disc list-inside mt-1.5 space-y-0.5 text-amber-700">
-                      <li>Trade / Company Name &rarr; Entity Name</li>
-                      <li>Geographical Domain (populated from <strong>PARISH_NAME</strong>)</li>
-                      <li>Location (Sub-City, Woreda, House No)</li>
-                      <li>Attach verified Manager Photo document metadata</li>
-                    </ul>
-                  </div>
-                </label>
+                </div>
+                <div className="max-h-44 overflow-y-auto divide-y divide-gray-50">
+                  {(cands || []).length > 0 && shownCands.map((c) => {
+                    const hasTin = Number(c.has_tin) === 1;
+                    return (
+                      <label
+                        key={c.id}
+                        className={'flex items-center gap-2.5 px-3.5 py-1.5 hover:bg-gray-50 ' + (hasTin ? 'cursor-pointer' : 'opacity-50 cursor-not-allowed')}
+                        title={hasTin ? undefined : 'This record has no TIN registered — add one on its record first'}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={picked.has(c.id)}
+                          onChange={(e) => toggleOne(c.id, e.target.checked)}
+                          disabled={loading || !hasTin}
+                          className="h-3.5 w-3.5 text-blue-600 rounded border-gray-300 focus:ring-blue-500"
+                        />
+                        <span className={'text-[11px] font-medium text-gray-800 truncate flex-1' + (hasTin ? '' : ' text-gray-400')}>{c.user_name}</span>
+                        {hasTin
+                          ? <span className="text-[10px] text-gray-400 font-mono">{c.tin}</span>
+                          : <span className="text-[10px] italic text-gray-400">no TIN</span>}
+                        {Number(c.has_photo) === 1 && <span title="Photo on file" className="text-[10px]">📷</span>}
+                      </label>
+                    );
+                  })}
+                  {cands && shownCands.length === 0 && (
+                    <p className="px-3.5 py-3 text-[11px] text-gray-400 text-center">No records match that filter.</p>
+                  )}
+                  {cands && (cands || []).length > 0 && tinCount === 0 && (
+                    <div className="px-3.5 py-3 bg-amber-50 border-t border-amber-200">
+                      <p className="text-[11px] text-amber-800 font-medium">None of the listed records carries a TIN.</p>
+                      <p className="text-[10px] text-amber-700 mt-0.5">
+                        TINs are imported with the file (Retailer TIN column) or verified per record. Re-import with a TIN column, or verify TINs individually first.
+                      </p>
+                    </div>
+                  )}
+                  {!cands && !candsError && (
+                    <p className="px-3.5 py-3 text-[11px] text-gray-400 text-center">Loading records…</p>
+                  )}
+                  {candsError && (
+                    <div className="px-3.5 py-3 text-center">
+                      <p className="text-[11px] text-red-600 font-medium">{candsError}</p>
+                      <button
+                        type="button"
+                        onClick={loadCandidates}
+                        className="mt-1.5 text-[11px] font-semibold text-blue-600 hover:text-blue-800"
+                      >
+                        Try again
+                      </button>
+                    </div>
+                  )}
+                </div>
+                <p className="px-3.5 py-1.5 text-[10px] text-gray-500 bg-gray-50 border-t border-gray-100">
+                  {(cands || []).length === 0
+                    ? 'No registered records found.'
+                    : noTinCount === 0
+                      ? `${picked.size} record${picked.size === 1 ? '' : 's'} will be checked${(cands || []).length >= 200 ? ' · showing the 200 most recent — filter to find older ones' : ''}`
+                      : `${tinCount} of ${(cands || []).length} records carry a TIN${noTinCount ? ` · ${noTinCount} without one can't be verified` : ''}${picked.size ? ` · ${picked.size} selected` : ''}`}
+                </p>
+              </div>
+
+              {/* ── Field consent ── */}
+              <div className="bg-amber-50/70 border border-amber-200 rounded-xl p-3.5">
+                <p className="text-xs font-semibold text-amber-900">Replace registered data with the official values</p>
+                <p className="text-[11px] text-amber-800 mt-0.5 leading-relaxed">
+                  Only the fields you tick are overwritten. Leave everything unticked to just verify without changing data.
+                </p>
+                <div className="mt-2.5 space-y-1.5">
+                  {BATCH_FIELD_OPTIONS.map((f) => (
+                    <label key={f.key} className="flex items-center gap-2.5 bg-white/70 border border-amber-200 rounded-lg px-2.5 py-1.5 cursor-pointer hover:bg-white transition">
+                      <input
+                        type="checkbox"
+                        checked={Boolean(fields[f.key])}
+                        onChange={(e) => setFields((prev) => ({ ...prev, [f.key]: e.target.checked }))}
+                        disabled={loading}
+                        className="h-3.5 w-3.5 text-amber-600 rounded border-gray-300 focus:ring-amber-500"
+                      />
+                      <span className="text-[11px] font-medium text-gray-800">{f.label}</span>
+                    </label>
+                  ))}
+                </div>
+                {fields.phone && (
+                  <p className="text-[10px] text-amber-700 mt-2">
+                    Note: a phone replace is skipped for any record whose official number is already registered to another user.
+                  </p>
+                )}
               </div>
             </>
           ) : (
@@ -2005,7 +1580,7 @@ function BatchVerifyTinsModal({ isOpen, onClose, onVerified }) {
                 <CheckCircle2 size={18} className="text-emerald-600" />
                 <span>Batch Verification Results</span>
               </div>
-              <div className="grid grid-cols-3 gap-2 text-center pt-2">
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-center pt-2">
                 <div className="bg-white p-2.5 rounded-lg border border-gray-200">
                   <span className="block text-[11px] text-gray-500">Total Checked</span>
                   <span className="text-base font-bold text-gray-900">{fmtNum(results.total)}</span>
@@ -2014,11 +1589,20 @@ function BatchVerifyTinsModal({ isOpen, onClose, onVerified }) {
                   <span className="block text-[11px] text-emerald-700">Verified</span>
                   <span className="text-base font-bold text-emerald-800">{fmtNum(results.verified)}</span>
                 </div>
+                <div className="bg-blue-50 p-2.5 rounded-lg border border-blue-200">
+                  <span className="block text-[11px] text-blue-700">Records Updated</span>
+                  <span className="text-base font-bold text-blue-800">{fmtNum(results.changed || 0)}</span>
+                </div>
                 <div className="bg-red-50 p-2.5 rounded-lg border border-red-200">
                   <span className="block text-[11px] text-red-600">Failed / Not Found</span>
                   <span className="text-base font-bold text-red-700">{fmtNum(results.failed)}</span>
                 </div>
               </div>
+              {Boolean(results.photos) && (
+                <p className="text-emerald-700 text-center text-xs mt-1 font-medium">
+                  📷 {results.photos} manager photo{results.photos === 1 ? '' : 's'} fetched from eTrade
+                </p>
+              )}
               {results.message && (
                 <p className="text-gray-500 text-center text-xs mt-1">{results.message}</p>
               )}
@@ -2040,11 +1624,12 @@ function BatchVerifyTinsModal({ isOpen, onClose, onVerified }) {
               <button
                 type="button"
                 onClick={handleBatchVerify}
-                disabled={loading}
+                disabled={loading || picked.size === 0}
+                title={!anyField ? 'Verify only — no registered data will be replaced' : 'Verify and replace the ticked fields'}
                 className="flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-60 rounded-lg shadow-sm transition"
               >
                 {loading ? <Loader2 size={16} className="animate-spin" /> : <ShieldCheck size={16} />}
-                {loading ? 'Verifying Records...' : 'Start Batch Verification'}
+                {loading ? 'Verifying Records...' : anyField ? 'Verify & Replace Selected' : 'Verify Only'}
               </button>
             </>
           ) : (
@@ -2375,12 +1960,29 @@ function projectToMap(lon, lat) {
 }
 
 /**
+ * Pin colour tiers. Size already scales with users; colour repeats that story
+ * so a crowded map still reads — and the pins don't all wear the same blue.
+ * A pin takes the first tier whose floor its share of the biggest area meets.
+ */
+const PIN_TIERS = [
+  { min: 0.5,  gradient: 'ethPinHot',  stroke: '#f43f5e', label: 'Hotspot' },
+  { min: 0.25, gradient: 'ethPinWarm', stroke: '#f59e0b', label: 'Large' },
+  { min: 0.1,  gradient: 'ethPinMid',  stroke: '#3b82f6', label: 'Medium' },
+  { min: 0,    gradient: 'ethPinLow',  stroke: '#10b981', label: 'Small' },
+];
+
+function pinTier(users, maxUsers) {
+  return PIN_TIERS.find(t => users / maxUsers >= t.min);
+}
+
+/**
  * The register on a map of Ethiopia.
  *
  * Every area is pinned where the source file says it is, the pin grows with the
- * number of users there, and pins that land on the same town are fanned out so
- * none hides another. A summary strip carries the areas the gazetteer could not
- * place instead of silently losing them.
+ * number of users there and wears the colour of its size tier, and pins that
+ * land on the same town are fanned out so none hides another. A summary strip
+ * carries the areas the gazetteer could not place instead of silently losing
+ * them.
  */
 function GeoMap({ areas, className = '' }) {
   const [hovered, setHovered] = useState(null);
@@ -2412,6 +2014,7 @@ function GeoMap({ areas, className = '' }) {
           x: base.x + (items.length > 1 ? Math.cos(angle) * spread : 0),
           y: base.y + (items.length > 1 ? Math.sin(angle) * spread : 0),
           r: 7 + 16 * Math.sqrt((Number(a.entities) || 0) / maxUsers),
+          tier: pinTier(Number(a.entities) || 0, maxUsers),
         });
       });
     }
@@ -2437,19 +2040,28 @@ function GeoMap({ areas, className = '' }) {
           <div>
             <h3 className="text-sm font-semibold text-gray-800">Distribution Map</h3>
             <p className="text-[11px] text-gray-500 mt-0.5">
-              Where the users sit, pin size by user count — {fmtNum(pins.length)} area(s) placed
+              Where the users sit, pin size &amp; colour by user count — {fmtNum(pins.length)} area(s) placed
             </p>
             <p className="text-[10px] text-gray-400 mt-0.5">
               Positions are gazetteer coordinates for the place names the file carries, not surveyed shop locations
             </p>
           </div>
         </div>
-        <div className="flex items-center gap-3 text-[11px] text-gray-500">
+        <div className="flex items-center gap-3 text-[11px] text-gray-500 flex-wrap">
           <span className="flex items-center gap-1.5">
-            <span className="w-2.5 h-2.5 rounded-full bg-blue-500" /> {fmtNum(pins.reduce((a, p) => a + p.users, 0))} users shown
+            <span className="flex -space-x-0.5">
+              {PIN_TIERS.map(t => (
+                <span key={t.gradient} className="w-2.5 h-2.5 rounded-full border border-white" style={{ backgroundColor: t.stroke }} />
+              ))}
+            </span>
+            {fmtNum(pins.reduce((a, p) => a + p.users, 0))} users shown
           </span>
-          <span className="flex items-center gap-1.5">
-            <span className="w-4 h-4 rounded-full bg-blue-500/20 border border-blue-500" /> size = users
+          <span className="flex items-center gap-2">
+            {PIN_TIERS.map(t => (
+              <span key={t.gradient} className="flex items-center gap-1" title={`≥ ${(t.min * 100).toFixed(0)}% of the largest area's users`}>
+                <span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: t.stroke }} /> {t.label}
+              </span>
+            ))}
           </span>
         </div>
       </div>
@@ -2461,12 +2073,25 @@ function GeoMap({ areas, className = '' }) {
               <stop offset="0%" stopColor="#e0f2fe" />
               <stop offset="100%" stopColor="#dcfce7" />
             </linearGradient>
-            <linearGradient id="ethPin" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor="#3b82f6" />
+            <linearGradient id="ethPinHot" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="#fb7185" />
+              <stop offset="100%" stopColor="#e11d48" />
+            </linearGradient>
+            <linearGradient id="ethPinWarm" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="#fbbf24" />
+              <stop offset="100%" stopColor="#f97316" />
+            </linearGradient>
+            <linearGradient id="ethPinMid" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="#60a5fa" />
               <stop offset="100%" stopColor="#6366f1" />
             </linearGradient>
+            <linearGradient id="ethPinLow" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="#34d399" />
+              <stop offset="100%" stopColor="#0d9488" />
+            </linearGradient>
+            {/* A neutral shadow: the old navy one was tuned for blue pins only. */}
             <filter id="ethPinShadow" x="-60%" y="-60%" width="220%" height="220%">
-              <feDropShadow dx="0" dy="2" stdDeviation="3" floodColor="#1e3a8a" floodOpacity="0.35" />
+              <feDropShadow dx="0" dy="2" stdDeviation="3" floodColor="#1e293b" floodOpacity="0.3" />
             </filter>
           </defs>
 
@@ -2498,12 +2123,12 @@ function GeoMap({ areas, className = '' }) {
                 cy={p.y}
                 r={p.r + 6}
                 fill="none"
-                stroke="#3b82f6"
+                stroke={p.tier.stroke}
                 strokeWidth={2}
                 style={{ animationDelay: `-${((i % 6) * 0.4).toFixed(2)}s` }}
               />
-              <circle cx={p.x} cy={p.y} r={p.r + 9} fill="#3b82f6" opacity={0.14} />
-              <circle cx={p.x} cy={p.y} r={p.r} fill="url(#ethPin)" stroke="#fff" strokeWidth={3} filter="url(#ethPinShadow)" />
+              <circle cx={p.x} cy={p.y} r={p.r + 9} fill={p.tier.stroke} opacity={0.14} />
+              <circle cx={p.x} cy={p.y} r={p.r} fill={`url(#${p.tier.gradient})`} stroke="#fff" strokeWidth={3} filter="url(#ethPinShadow)" />
               <text
                 x={p.x}
                 y={p.y + 4}
@@ -2533,7 +2158,8 @@ function GeoMap({ areas, className = '' }) {
         {hovered && (
           <div className="absolute top-4 left-4 bg-white/95 backdrop-blur rounded-xl border border-gray-200 shadow-lg px-4 py-3 pointer-events-none">
             <p className="text-sm font-semibold text-gray-900">{hovered.label}</p>
-            <p className="text-xs text-gray-500 mt-0.5">
+            <p className="text-xs text-gray-500 mt-0.5 flex items-center gap-1.5">
+              <span className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: hovered.tier.stroke }} />
               {fmtNum(hovered.users)} user(s) · {hovered.share.toFixed(1)}% of the network
             </p>
             {hovered.area !== hovered.label && (

@@ -1,6 +1,9 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { useAuth } from '../context/AuthContext';
 import { channelAPI } from '../services/api';
+import { EditEntityModal, DeleteEntityModal } from '../components/channel/EntityModals';
+import ManagerPhoto from '../components/channel/ManagerPhoto';
+import ColumnPicker, { loadColumnPrefs } from '../components/ColumnPicker';
 import {
   Tooltip, LabelList, Legend, ResponsiveContainer, PieChart, Pie, Cell,
   BarChart, Bar, ComposedChart, Line,
@@ -12,6 +15,7 @@ import {
   Globe, Layers, ArrowUpRight, ArrowDownRight, Minus,
   Download, Filter, Loader2, Store, X, CornerDownRight,
   Hash, Activity, PieChart as PieChartIcon, BarChart3,
+  Edit3, Trash2, Camera,
 } from 'lucide-react';
 import toast from 'react-hot-toast';
 
@@ -43,7 +47,12 @@ function ImportStamp({ code, at }) {
 }
 
 export default function ChannelDashboard() {
-  const { user } = useAuth();
+  const { user, hasAnyPermission } = useAuth();
+  // Editing and deleting registered records is a grant, not a given: a role
+  // needs channel_entities.edit / channel_entities.delete (the master admin
+  // holds every permission, so the buttons simply appear for them).
+  const canEditEntity = hasAnyPermission('channel_entities.edit');
+  const canDeleteEntity = hasAnyPermission('channel_entities.delete');
   const [kpis, setKpis] = useState(null);
   const [entities, setEntities] = useState(null);
   const [trend, setTrend] = useState(null);
@@ -58,6 +67,10 @@ export default function ChannelDashboard() {
   const [entityGeo, setEntityGeo] = useState('');
   const [activeTab, setActiveTab] = useState('overview');
   const [selectedEntity, setSelectedEntity] = useState(null);
+  // Edit / Delete from the Entity Registry: the row feeds the shared modals
+  // (same ones the Reports tables use), and a save or delete reloads the list.
+  const [editingEntity, setEditingEntity] = useState(null);
+  const [deletingEntity, setDeletingEntity] = useState(null);
 
   // Hierarchy drill-down: which level is on screen and which node we descended
   // through to get here. `path` doubles as the breadcrumb.
@@ -138,6 +151,33 @@ export default function ChannelDashboard() {
     } catch (e) { /* ignore */ }
   }
 
+  function refreshRegistry() {
+    loadEntities();
+    channelAPI.getKPIs().then(setKpis).catch(() => {});
+  }
+
+  // The registry list carries only the table's columns, but the edit form needs
+  // every field (trade name, woreda, sub-city, notes...) — and the delete
+  // warning needs the downstream count. Pull the full record first, so a save
+  // can never quietly blank the fields the list view does not show.
+  async function openEditEntity(row) {
+    try {
+      const data = await channelAPI.getEntity(row.id);
+      setEditingEntity(data.entity);
+    } catch (e) {
+      toast.error('Could not load the record for editing');
+    }
+  }
+
+  async function openDeleteEntity(row) {
+    try {
+      const data = await channelAPI.getEntity(row.id);
+      setDeletingEntity({ ...row, ...data.entity, direct_children: (data.children || []).length });
+    } catch (e) {
+      setDeletingEntity(row);
+    }
+  }
+
   const periods = meta?.periods || [];
 
   // The period series: how the register has grown, level by level. This is the
@@ -165,6 +205,8 @@ export default function ChannelDashboard() {
 
   const businessBars = useMemo(
     () => (kpis?.by_business_type || [])
+      // Only retailers carry an Existing Business now, so the chart title
+      // says retailers and any legacy upline values stay out of the bars.
       .filter(b => b.business_type && b.business_type !== 'Unspecified')
       .slice(0, 8)
       .map(b => ({ name: b.business_type, users: Number(b.entities) || 0 })),
@@ -352,8 +394,8 @@ export default function ChannelDashboard() {
               <div className="flex items-start gap-2.5 mb-4">
                 <span className="p-1.5 rounded-lg bg-amber-50 text-amber-600"><BarChart3 size={16} /></span>
                 <div>
-                  <h3 className="text-sm font-semibold text-gray-800">Users by Existing Business</h3>
-                  <p className="text-[11px] text-gray-500 mt-0.5">The business each imported user runs</p>
+                  <h3 className="text-sm font-semibold text-gray-800">Retailers by Existing Business</h3>
+                  <p className="text-[11px] text-gray-500 mt-0.5">The business each retailer runs — distributors and sub-distributors carry none</p>
                 </div>
               </div>
               {businessBars.length === 0 ? (
@@ -440,9 +482,26 @@ export default function ChannelDashboard() {
           entityCategory={entityCategory} setEntityCategory={setEntityCategory}
           entityGeo={entityGeo} setEntityGeo={setEntityGeo}
           meta={meta} onEntityClick={handleEntityClick}
+          onEditEntity={canEditEntity ? openEditEntity : undefined}
+          onDeleteEntity={canDeleteEntity ? openDeleteEntity : undefined}
           selectedEntity={selectedEntity} onCloseEntity={() => setSelectedEntity(null)}
         />
       )}
+
+      {/* Shared edit / delete modals — the same ones the Reports tables use.
+          They live at the page level because their state does. */}
+      <EditEntityModal
+        isOpen={Boolean(editingEntity)}
+        entity={editingEntity}
+        onClose={() => setEditingEntity(null)}
+        onUpdated={refreshRegistry}
+      />
+      <DeleteEntityModal
+        isOpen={Boolean(deletingEntity)}
+        entity={deletingEntity}
+        onClose={() => setDeletingEntity(null)}
+        onDeleted={refreshRegistry}
+      />
     </div>
   );
 }
@@ -469,6 +528,33 @@ function HierarchyView({ ctx, setCtx, report, loading, page, setPage, search, se
   const rows = report?.rows || [];
   const s = report?.summary || {};
   const pages = report?.pagination?.pages || 0;
+
+  // Column preferences for the details table, per hierarchy level.
+  const hierColDefs = useMemo(() => [
+    { key: 'name', label: spec.singular, always: true },
+    { key: 'identifier', label: 'Identifier Code' },
+    { key: 'geo', label: 'Region / Domain' },
+    ...(ctx.level === 3 ? [{ key: 'business', label: 'Business' }] : []),
+    { key: 'product', label: 'Air Time' },
+    { key: 'status', label: 'Status' },
+    ...(ctx.level === 2 ? [{ key: 'owner', label: 'Distributor' }] : []),
+    ...(ctx.level === 3 ? [{ key: 'parent', label: 'Sub Distributor' }, { key: 'owner', label: 'Distributor' }] : []),
+    ...(ctx.level === 1 ? [
+      { key: 'subdists', label: 'Sub-Dists' },
+      { key: 'retailers', label: 'Retailers' },
+    ] : []),
+    ...(ctx.level === 2 ? [{ key: 'retailers', label: 'Retailers' }] : []),
+    { key: 'imported', label: 'Imported by' },
+    { key: 'open', label: 'Open', always: true },
+  ], [ctx.level, spec.singular]);
+  const hierKeys = useMemo(() => hierColDefs.map((c) => c.key), [hierColDefs]);
+  const hierStorage = `channel_cols_hier_${ctx.level}`;
+  const [hierCols, setHierCols] = useState(() => loadColumnPrefs(hierStorage, hierKeys));
+  useEffect(() => {
+    setHierCols(loadColumnPrefs(hierStorage, hierKeys));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hierStorage, hierKeys.join(',')]);
+  const hshow = (k) => hierCols.has(k);
 
   async function openDetail(id) {
     setDetailLoading(true);
@@ -574,6 +660,12 @@ function HierarchyView({ ctx, setCtx, report, loading, page, setPage, search, se
               {' '}{fmtNum(report?.pagination?.total || 0)} record(s).
             </p>
           </div>
+          <ColumnPicker
+            columns={hierColDefs}
+            visible={hierCols}
+            setVisible={setHierCols}
+            storageKey={hierStorage}
+          />
         </div>
 
         {loading ? (
@@ -590,22 +682,22 @@ function HierarchyView({ ctx, setCtx, report, loading, page, setPage, search, se
               <thead>
                 <tr className="bg-gray-50 border-b border-gray-200">
                   <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">{spec.singular}</th>
-                  <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Identifier Code</th>
-                  <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Region / Domain</th>
-                  <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Business</th>
-                  <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Air Time</th>
-                  <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Status</th>
-                  {ctx.level === 2 && <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Distributor</th>}
-                  {ctx.level === 3 && <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Sub Distributor</th>}
-                  {ctx.level === 3 && <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Distributor</th>}
-                  {ctx.level === 1 && (
-                    <>
-                      <th className="px-4 py-3 text-right text-xs font-semibold text-gray-600">Sub-Dists</th>
-                      <th className="px-4 py-3 text-right text-xs font-semibold text-gray-600">Retailers</th>
-                    </>
+                  {hshow('identifier') && <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Identifier Code</th>}
+                  {hshow('geo') && <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Region / Domain</th>}
+                  {ctx.level === 3 && hshow('business') && <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Business</th>}
+                  {hshow('product') && <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Air Time</th>}
+                  {hshow('status') && <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Status</th>}
+                  {ctx.level === 2 && hshow('owner') && <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Distributor</th>}
+                  {ctx.level === 3 && hshow('parent') && <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Sub Distributor</th>}
+                  {ctx.level === 3 && hshow('owner') && <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Distributor</th>}
+                  {ctx.level === 1 && hshow('subdists') && (
+                    <th className="px-4 py-3 text-right text-xs font-semibold text-gray-600">Sub-Dists</th>
                   )}
-                  {ctx.level === 2 && <th className="px-4 py-3 text-right text-xs font-semibold text-gray-600">Retailers</th>}
-                  <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Imported by</th>
+                  {ctx.level === 1 && hshow('retailers') && (
+                    <th className="px-4 py-3 text-right text-xs font-semibold text-gray-600">Retailers</th>
+                  )}
+                  {ctx.level === 2 && hshow('retailers') && <th className="px-4 py-3 text-right text-xs font-semibold text-gray-600">Retailers</th>}
+                  {hshow('imported') && <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Imported by</th>}
                   <th className="px-4 py-3 text-right text-xs font-semibold text-gray-600">Open</th>
                 </tr>
               </thead>
@@ -620,36 +712,39 @@ function HierarchyView({ ctx, setCtx, report, loading, page, setPage, search, se
                       <p className="font-medium text-gray-800 max-w-[220px] truncate" title={r.user_name}>{r.user_name}</p>
                       <p className="text-xs text-gray-500 font-mono">{r.mobile_number}</p>
                     </td>
-                    <td className="px-4 py-3"><IdentifierTag code={r.identifier_code} /></td>
-                    <td className="px-4 py-3 text-gray-600 max-w-[150px] truncate" title={r.geo_domain_raw || ''}>{r.geo_domain_raw || '—'}</td>
-                    <td className="px-4 py-3 text-gray-600 max-w-[150px] truncate" title={r.business_type || ''}>{r.business_type || '—'}</td>
-                    <td className="px-4 py-3 text-gray-600">{r.product || '—'}</td>
-                    <td className="px-4 py-3">
-                      <span className={'inline-block px-2 py-0.5 rounded border text-[11px] font-medium capitalize ' + (STATUS_COLORS[r.status] || STATUS_COLORS.inactive)}>
-                        {r.status || '—'}
-                      </span>
-                    </td>
-                    {ctx.level === 2 && (
+                    {hshow('identifier') && <td className="px-4 py-3"><IdentifierTag code={r.identifier_code} /></td>}
+                    {hshow('geo') && <td className="px-4 py-3 text-gray-600 max-w-[150px] truncate" title={r.geo_domain_raw || ''}>{r.geo_domain_raw || '—'}</td>}
+                    {ctx.level === 3 && hshow('business') && (
+                      <td className="px-4 py-3 text-gray-600 max-w-[150px] truncate" title={r.business_type || ''}>{r.business_type || '—'}</td>
+                    )}
+                    {hshow('product') && <td className="px-4 py-3 text-gray-600">{r.product || '—'}</td>}
+                    {hshow('status') && (
+                      <td className="px-4 py-3">
+                        <span className={'inline-block px-2 py-0.5 rounded border text-[11px] font-medium capitalize ' + (STATUS_COLORS[r.status] || STATUS_COLORS.inactive)}>
+                          {r.status || '—'}
+                        </span>
+                      </td>
+                    )}
+                    {ctx.level === 2 && hshow('owner') && (
                       <td className="px-4 py-3 text-gray-600 max-w-[180px] truncate" title={r.owner_name || ''}>{r.owner_name || '—'}</td>
                     )}
-                    {ctx.level === 3 && (
+                    {ctx.level === 3 && hshow('parent') && (
                       <td className="px-4 py-3 text-gray-600 max-w-[180px] truncate" title={r.parent_name || ''}>{r.parent_name || '—'}</td>
                     )}
-                    {ctx.level === 3 && (
+                    {ctx.level === 3 && hshow('owner') && (
                       <td className="px-4 py-3 text-gray-600 max-w-[180px] truncate" title={r.owner_name || ''}>{r.owner_name || '—'}</td>
                     )}
-                    {ctx.level === 1 && (
-                      <>
-                        <td className="px-4 py-3 text-right text-gray-600">{fmtNum(r.sub_distributors)}</td>
-                        <td className="px-4 py-3 text-right text-gray-600">{fmtNum(r.retailers)}</td>
-                      </>
+                    {ctx.level === 1 && hshow('subdists') && (
+                      <td className="px-4 py-3 text-right text-gray-600" title="Distinct Sub-Distributors of the Retailers this Distributor owns">{fmtNum(r.subs_through ?? r.sub_distributors)}</td>
                     )}
-                    {ctx.level === 2 && (
+                    {(ctx.level === 1 || ctx.level === 2) && hshow('retailers') && (
                       <td className="px-4 py-3 text-right text-gray-600">{fmtNum(r.retailers)}</td>
                     )}
-                    <td className="px-4 py-3 whitespace-nowrap">
-                      <ImportStamp code={r.import_code} at={r.imported_at} />
-                    </td>
+                    {hshow('imported') && (
+                      <td className="px-4 py-3 whitespace-nowrap">
+                        <ImportStamp code={r.import_code} at={r.imported_at} />
+                      </td>
+                    )}
                     <td className="px-4 py-3 text-right">
                       <button
                         onClick={(e) => { e.stopPropagation(); openDetail(r.id); }}
@@ -692,19 +787,55 @@ function HierarchyView({ ctx, setCtx, report, loading, page, setPage, search, se
 }
 
 /** The whole profile of one registry row, plus what sits under it. */
+/**
+ * Downstream children grouped the way the channel thinks: Distributors first,
+ * then Sub-Distributors, then Retailers. Every list that renders children —
+ * the hierarchy card and the registry detail modal — goes through this so the
+ * ordering and headings can never drift apart.
+ */
+const DOWNSTREAM_GROUPS = [
+  { level: 1, label: 'Distributors' },
+  { level: 2, label: 'Sub-Distributors' },
+  { level: 3, label: 'Retailers' },
+];
+
+function groupDownstream(children) {
+  const buckets = { 1: [], 2: [], 3: [] };
+  (children || []).forEach((c) => {
+    const l = Number(c.level);
+    if (buckets[l]) buckets[l].push(c);
+  });
+  return DOWNSTREAM_GROUPS
+    .filter((g) => buckets[g.level].length > 0)
+    .map((g) => ({ ...g, items: buckets[g.level] }));
+}
+
 function EntityDetailCard({ data, onClose }) {
   const e = data.entity || {};
   const children = data.children || [];
+  // Sub-Distributors can serve several Distributors — the registry files them
+  // under one, but their retailers' owners tell the whole story.
+  const distributors = data.distributors || [];
   const fields = [
     ['Mobile number', e.mobile_number],
     ['Category', e.category_label ? `${e.category_label} (L${e.level})` : null],
     ['Domain', e.domain_name],
     ['Status', e.status],
-    ['Region / Domain', e.geo_domain_raw],
-    ['Existing business', e.business_type],
+    // A Sub-Distributor has no territory of its own and only a Retailer
+    // carries an Existing Business, so both are suppressed off their levels.
+    ...(Number(e.level) === 2 ? [] : [['Region / Domain', e.geo_domain_raw]]),
+    ...(Number(e.level) === 3 ? [['Existing business', e.business_type]] : []),
     ['Air time type', e.product],
-    ['Sub-Distributor', e.parent_name ? `${e.parent_name} · ${e.parent_mobile || ''}` : null],
-    ['Distributor', e.owner_name ? `${e.owner_name} · ${e.owner_mobile || ''}` : null],
+    // Upline links. A sub's filed parent IS its distributor — the owner row
+    // already shows it, so the parent row only appears on a retailer (whose
+    // parent is its Sub-Distributor). Mobiles ride along now that the detail
+    // endpoint returns them.
+    ...(Number(e.level) === 3 && e.parent_name
+      ? [['Sub-Distributor', e.parent_mobile ? `${e.parent_name} · ${e.parent_mobile}` : e.parent_name]]
+      : []),
+    ...(e.owner_name
+      ? [['Distributor', e.owner_mobile ? `${e.owner_name} · ${e.owner_mobile}` : e.owner_name]]
+      : []),
     ['Source', e.source],
     // A retailer's record is about the shop, not the reporting window, so the
     // seen dates are dropped at level 3.
@@ -736,6 +867,21 @@ function EntityDetailCard({ data, onClose }) {
               </div>
             ))}
           </dl>
+          {Number(e.level) === 2 && distributors.length > 1 && (
+            <div className="mt-2 pt-2 border-t border-gray-100">
+              <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-1">
+                Works with {distributors.length} Distributors
+              </p>
+              {distributors.map((d) => (
+                <div key={d.id} className="flex items-center gap-2 text-xs py-0.5">
+                  <span className="text-gray-800 truncate flex-1" title={d.user_name}>{d.user_name}</span>
+                  <span className="text-gray-500 font-mono">{d.mobile_number}</span>
+                  <span className="text-[10px] text-gray-400 whitespace-nowrap">{d.retailers} rts</span>
+                  {d.is_filed && <span className="text-[10px] px-1 rounded bg-blue-50 text-blue-600">filed</span>}
+                </div>
+              ))}
+            </div>
+          )}
         </div>
         <div>
           <p className="text-[11px] font-semibold text-gray-500 uppercase tracking-wider mb-2">
@@ -744,13 +890,19 @@ function EntityDetailCard({ data, onClose }) {
           {children.length === 0 ? (
             <p className="text-xs text-gray-500">Nothing registered underneath this record.</p>
           ) : (
-            <div className="max-h-40 overflow-y-auto space-y-1">
-              {children.slice(0, 50).map((c) => (
-                <div key={c.id} className="flex items-center gap-2 text-xs px-2 py-1 bg-gray-50 rounded">
-                  <CornerDownRight size={12} className="text-gray-400 shrink-0" />
-                  <span className="text-gray-800 truncate flex-1">{c.user_name}</span>
-                  <span className="text-gray-500">{c.category_label}</span>
-
+            <div className="max-h-40 overflow-y-auto space-y-2">
+              {groupDownstream(children).map((grp) => (
+                <div key={grp.level}>
+                  <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-1">
+                    {grp.label} ({grp.items.length})
+                  </p>
+                  {grp.items.slice(0, 50).map((c) => (
+                    <div key={c.id} className="flex items-center gap-2 text-xs px-2 py-1 bg-gray-50 rounded">
+                      <CornerDownRight size={12} className="text-gray-400 shrink-0" />
+                      <span className="text-gray-800 truncate flex-1">{c.user_name}</span>
+                      <span className="text-gray-500">{c.mobile_number}</span>
+                    </div>
+                  ))}
                 </div>
               ))}
             </div>
@@ -815,10 +967,36 @@ function KPICard({ label, value, icon, color, sub }) {
   );
 }
 
-function RegistryView({ entities, entitySearch, setEntitySearch, entityPage, setEntityPage, entityDomain, setEntityDomain, entityCategory, setEntityCategory, entityGeo, setEntityGeo, meta, onEntityClick, selectedEntity, onCloseEntity }) {
+function RegistryView({ entities, entitySearch, setEntitySearch, entityPage, setEntityPage, entityDomain, setEntityDomain, entityCategory, setEntityCategory, entityGeo, setEntityGeo, meta, onEntityClick, onEditEntity, onDeleteEntity, selectedEntity, onCloseEntity }) {
+  const canEdit = Boolean(onEditEntity);
+  const canDelete = Boolean(onDeleteEntity);
+  const canModify = canEdit || canDelete;
   // Areas are ranked by how many channel users sit in them, so the busiest
   // places surface first in the filter.
   const geoChoices = (meta?.geo_values || []).map(g => g.value).filter(Boolean);
+
+  // Column preferences — same picker as the reports tables.
+  const colDefs = useMemo(() => [
+    { key: 'name', label: 'Name', always: true },
+    { key: 'identifier', label: 'Identifier Code' },
+    { key: 'mobile', label: 'Mobile' },
+    { key: 'category', label: 'Category' },
+    { key: 'domain', label: 'Domain' },
+    { key: 'status', label: 'Status' },
+    { key: 'area', label: 'Area' },
+    { key: 'parent', label: 'Sub-Distributor' },
+    { key: 'owner', label: 'Distributor' },
+    { key: 'imported', label: 'Imported by' },
+    ...(canModify ? [{ key: 'actions', label: 'Actions', always: true }] : []),
+  ], [canModify]);
+  const allColKeys = useMemo(() => colDefs.map((c) => c.key), [colDefs]);
+  const storageKey = 'channel_cols_registry';
+  const [visibleCols, setVisibleCols] = useState(() => loadColumnPrefs(storageKey, allColKeys));
+  useEffect(() => {
+    setVisibleCols(loadColumnPrefs(storageKey, allColKeys));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [storageKey, allColKeys.join(',')]);
+  const show = (k) => visibleCols.has(k);
 
   return (
     <div className="space-y-4">
@@ -851,6 +1029,14 @@ function RegistryView({ entities, entitySearch, setEntitySearch, entityPage, set
               Clear
             </button>
           )}
+          <div className="sm:ml-auto">
+            <ColumnPicker
+              columns={colDefs}
+              visible={visibleCols}
+              setVisible={setVisibleCols}
+              storageKey={storageKey}
+            />
+          </div>
         </div>
       </div>
 
@@ -866,40 +1052,82 @@ function RegistryView({ entities, entitySearch, setEntitySearch, entityPage, set
             <thead>
               <tr className="bg-gray-50 border-b border-gray-200">
                 <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Name</th>
-                <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Identifier Code</th>
-                <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Mobile</th>
-                <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Category</th>
-                <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Domain</th>
-                <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Status</th>
-                <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Area</th>
-                <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Sub-Distributor</th>
-                <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Distributor</th>
-                <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Imported by</th>
+                {show('identifier') && <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Identifier Code</th>}
+                {show('mobile') && <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Mobile</th>}
+                {show('category') && <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Category</th>}
+                {show('domain') && <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Domain</th>}
+                {show('status') && <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Status</th>}
+                {show('area') && <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Area</th>}
+                {show('parent') && <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Sub-Distributor</th>}
+                {show('owner') && <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Distributor</th>}
+                {show('imported') && <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Imported by</th>}
+                {canModify && show('actions') && (
+                  <th className="px-4 py-3 text-center text-xs font-semibold text-gray-600">Actions</th>
+                )}
               </tr>
             </thead>
             <tbody>
               {(entities?.entities || []).map(e => (
                 <tr key={e.id} className="border-b border-gray-50 hover:bg-blue-50/30 cursor-pointer transition" onClick={() => onEntityClick(e.id)}>
-                  <td className="px-4 py-3 font-medium text-gray-800 max-w-[200px] truncate" title={e.user_name}>{e.user_name}</td>
-                  <td className="px-4 py-3"><IdentifierTag code={e.identifier_code} /></td>
-                  <td className="px-4 py-3 text-gray-600 font-mono text-xs">{e.mobile_number}</td>
-                  <td className="px-4 py-3 text-gray-600">{e.category_label}</td>
-                  <td className="px-4 py-3 text-gray-600">{e.domain_name}</td>
-                  <td className="px-4 py-3">
-                    <span className={'inline-block px-2 py-0.5 text-xs font-medium rounded-full border ' + (STATUS_COLORS[e.status] || STATUS_COLORS.active)}>
-                      {e.status}
-                    </span>
+                  <td className="px-4 py-3 font-medium text-gray-800 max-w-[220px]" title={e.user_name}>
+                    <div className="flex items-center gap-2 min-w-0">
+                      {e.has_photo && (
+                        <ManagerPhoto
+                          tin={e.tin}
+                          alt={e.user_name}
+                          className="w-7 h-7 rounded-full object-cover border border-emerald-300 shrink-0"
+                        />
+                      )}
+                      <span className="truncate">{e.user_name}</span>
+                    </div>
                   </td>
-                  <td className="px-4 py-3 text-gray-500 text-xs max-w-[140px] truncate" title={e.geo_domain_raw || ''}>{e.geo_domain_raw || '--'}</td>
-                  <td className="px-4 py-3 text-gray-500 text-xs max-w-[150px] truncate" title={e.parent_name || ''}>{e.parent_name || '--'}</td>
-                  <td className="px-4 py-3 text-gray-500 text-xs max-w-[150px] truncate" title={e.owner_name || ''}>{e.owner_name || '--'}</td>
-                  <td className="px-4 py-3 whitespace-nowrap">
-                    <ImportStamp code={e.import_code} at={e.imported_at} />
-                  </td>
+                  {show('identifier') && <td className="px-4 py-3"><IdentifierTag code={e.identifier_code} /></td>}
+                  {show('mobile') && <td className="px-4 py-3 text-gray-600 font-mono text-xs">{e.mobile_number}</td>}
+                  {show('category') && <td className="px-4 py-3 text-gray-600">{e.category_label}</td>}
+                  {show('domain') && <td className="px-4 py-3 text-gray-600">{e.domain_name}</td>}
+                  {show('status') && (
+                    <td className="px-4 py-3">
+                      <span className={'inline-block px-2 py-0.5 text-xs font-medium rounded-full border ' + (STATUS_COLORS[e.status] || STATUS_COLORS.active)}>
+                        {e.status}
+                      </span>
+                    </td>
+                  )}
+                  {show('area') && <td className="px-4 py-3 text-gray-500 text-xs max-w-[140px] truncate" title={e.geo_domain_raw || ''}>{e.geo_domain_raw || '--'}</td>}
+                  {show('parent') && <td className="px-4 py-3 text-gray-500 text-xs max-w-[150px] truncate" title={e.parent_name || ''}>{e.parent_name || '--'}</td>}
+                  {show('owner') && <td className="px-4 py-3 text-gray-500 text-xs max-w-[150px] truncate" title={e.owner_name || ''}>{e.owner_name || '--'}</td>}
+                  {show('imported') && (
+                    <td className="px-4 py-3 whitespace-nowrap">
+                      <ImportStamp code={e.import_code} at={e.imported_at} />
+                    </td>
+                  )}
+                  {canModify && show('actions') && (
+                    <td className="px-4 py-3 whitespace-nowrap" onClick={(ev) => ev.stopPropagation()}>
+                      <div className="flex items-center justify-center gap-1">
+                        {canEdit && (
+                          <button
+                            onClick={() => onEditEntity(e)}
+                            className="p-1.5 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition"
+                            title={`Edit ${e.user_name}`}
+                          >
+                            <Edit3 size={15} />
+                          </button>
+                        )}
+                        {canDelete && (
+                          <button
+                            onClick={() => onDeleteEntity(e)}
+                            className="p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition"
+                            title={`Delete ${e.user_name}`}
+                          >
+                            <Trash2 size={15} />
+                          </button>
+                        )}
+                      </div>
+                    </td>
+                  )}
                 </tr>
               ))}
               {(!entities?.entities || entities.entities.length === 0) && (
-                <tr><td colSpan={10} className="px-4 py-12 text-center text-gray-400">No channel users found</td></tr>
+                <tr><td colSpan={colDefs.filter(c => show(c.key)).length} className="px-4 py-12 text-center text-gray-400">No channel users found</td></tr>
               )}
             </tbody>
           </table>
@@ -928,9 +1156,41 @@ function RegistryView({ entities, entitySearch, setEntitySearch, entityPage, set
 
 function EntityDetailModal({ entity, onClose }) {
   const { entity: e, children = [] } = entity;
+  const [photoMeta, setPhotoMeta] = useState(null);
+  // Sub-Distributors can serve several Distributors — the registry files them
+  // under one, but their retailers' owners tell the whole story.
+  const distributors = entity.distributors || [];
+
+  // The manager photo lives against the record's TIN, fetched from eTrade's
+  // Registration API during TIN verification. Look up who it shows while the
+  // modal is open so the card can name the manager.
+  useEffect(() => {
+    setPhotoMeta(null);
+    if (!e?.tin) return undefined;
+    let cancelled = false;
+    channelAPI.getPhotoMeta(e.tin)
+      .then((meta) => { if (!cancelled && meta?.found) setPhotoMeta(meta); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [e?.id, e?.tin]);
+
+  // Upline links shown the way the channel thinks: a retailer's Sub-
+  // Distributor row names its parent; a sub-distributor's row IS the parent,
+  // so its parent slot shows its Distributor instead — no duplicate label
+  // carrying the same name on both rows.
+  const uplineRows = Number(e.level) === 3
+    ? [
+      ['Sub-Distributor', e.parent_name ? (e.parent_mobile ? `${e.parent_name} · ${e.parent_mobile}` : e.parent_name) : '--'],
+      ['Distributor', e.owner_name ? (e.owner_mobile ? `${e.owner_name} · ${e.owner_mobile}` : e.owner_name) : '--'],
+    ]
+    : Number(e.level) === 2
+      ? [
+        ['Distributor', e.owner_name ? (e.owner_mobile ? `${e.owner_name} · ${e.owner_mobile}` : e.owner_name) : '--'],
+      ]
+      : [];
   const infoGrid = [
-    ['Status', e.status], ['Product', e.product], ['Sub-Distributor', e.parent_name || '--'],
-    ['Distributor', e.owner_name || '--'],
+    ['Status', e.status], ['Product', e.product],
+    ...uplineRows,
     ['Geo', e.geo_domain_raw || '--'], ['Source', e.source || '--'],
     // Retailers no longer carry a reporting window on their detail view.
     ...(Number(e.level) === 3 ? [] : [
@@ -955,6 +1215,30 @@ function EntityDetailModal({ entity, onClose }) {
           <button onClick={onClose} className="p-2 hover:bg-gray-100 rounded-lg text-gray-400 hover:text-gray-600">X</button>
         </div>
         <div className="p-5 space-y-5">
+          {/* Company manager photo — attached to the record's TIN from the
+              eTrade registration record during TIN verification. */}
+          {e.tin && (
+            <div className="bg-gradient-to-r from-emerald-50 to-teal-50 border border-emerald-200 rounded-xl p-3.5 flex items-center gap-3.5">
+              <ManagerPhoto
+                tin={e.tin}
+                alt={e.user_name}
+                className="w-16 h-16 rounded-xl object-cover border-2 border-emerald-400 shrink-0"
+              />
+              <div className="min-w-0">
+                <p className="text-[10px] font-bold text-emerald-800 uppercase tracking-wider flex items-center gap-1">
+                  <Camera size={11} className="text-emerald-700" />
+                  Company Manager Photo
+                </p>
+                <p className="text-sm font-bold text-gray-900 mt-0.5 truncate">
+                  {photoMeta?.manager_name_eng || photoMeta?.manager_name || e.user_name}
+                </p>
+                <p className="text-[11px] text-gray-500 font-mono">
+                  TIN {e.tin}
+                  {photoMeta?.source === 'upload' ? ' · custom upload' : photoMeta ? ' · eTrade / MoR' : ''}
+                </p>
+              </div>
+            </div>
+          )}
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
             {infoGrid.map(([label, val]) => (
               <div key={label}>
@@ -963,17 +1247,41 @@ function EntityDetailModal({ entity, onClose }) {
               </div>
             ))}
           </div>
+          {Number(e.level) === 2 && distributors.length > 1 && (
+            <div className="bg-indigo-50 border border-indigo-100 rounded-xl p-3">
+              <p className="text-[10px] font-bold text-indigo-800 uppercase tracking-wider mb-1.5">
+                Works with {distributors.length} Distributors
+              </p>
+              <div className="space-y-1">
+                {distributors.map((d) => (
+                  <div key={d.id} className="flex items-center gap-2 text-xs">
+                    <span className="font-medium text-gray-800 truncate flex-1" title={d.user_name}>{d.user_name}</span>
+                    <span className="text-gray-500 font-mono">{d.mobile_number}</span>
+                    <span className="text-[10px] text-indigo-500 whitespace-nowrap">{d.retailers} retailer{d.retailers === 1 ? '' : 's'}</span>
+                    {d.is_filed && <span className="text-[10px] px-1 rounded bg-white text-indigo-600 border border-indigo-200">filed</span>}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
           {children.length > 0 && (
             <div>
               <h4 className="text-sm font-semibold text-gray-800 mb-2">Downstream Users ({children.length})</h4>
               <div className="bg-gray-50 rounded-lg p-3 max-h-48 overflow-y-auto">
-                {children.map(c => (
-                  <div key={c.id} className="flex items-center justify-between py-1 border-b border-gray-100 last:border-0">
-                    <div>
-                      <span className="text-xs font-medium text-gray-800">{c.user_name}</span>
-                      <span className="text-[10px] text-gray-500 ml-2">{c.mobile_number}</span>
-                    </div>
-                    <span className={'text-[10px] px-1.5 py-0.5 rounded ' + (STATUS_COLORS[c.status] || '')}>{c.status}</span>
+                {groupDownstream(children).map((grp) => (
+                  <div key={grp.level} className="mb-2 last:mb-0">
+                    <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-1">
+                      {grp.label} ({grp.items.length})
+                    </p>
+                    {grp.items.map(c => (
+                      <div key={c.id} className="flex items-center justify-between py-1 border-b border-gray-100 last:border-0">
+                        <div>
+                          <span className="text-xs font-medium text-gray-800">{c.user_name}</span>
+                          <span className="text-[10px] text-gray-500 ml-2">{c.mobile_number}</span>
+                        </div>
+                        <span className={'text-[10px] px-1.5 py-0.5 rounded ' + (STATUS_COLORS[c.status] || '')}>{c.status}</span>
+                      </div>
+                    ))}
                   </div>
                 ))}
               </div>

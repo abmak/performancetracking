@@ -6,6 +6,8 @@ import {
   Phone, MapPin, Building, FileText, Sparkles, RefreshCw, Upload, Image as ImageIcon,
 } from 'lucide-react';
 import toast from 'react-hot-toast';
+import ManagerPhoto from '../components/channel/ManagerPhoto';
+import { fileToBase64 } from '../utils/helpers';
 
 /**
  * Single Registration.
@@ -14,11 +16,17 @@ import toast from 'react-hot-toast';
  * level first — Distributor, Sub-Distributor or Retailer — and the form shows
  * exactly the columns that level's sheet carries:
  *
- *   Distributor      Distributor Name | Existing Business | Mobile | Status |
- *                    Distributor Region | Air Time Type | Available Balance
- *   Sub-Distributor  … + Geographical Domain, and the Distributor it belongs to
- *   Retailer         … + the Sub Distributor it belongs to, plus three optional
- *                    compliance columns: TIN, Location and National/Fayda ID
+ *   Distributor      Distributor Name | Mobile | Status | Distributor Region |
+ *                    Air Time Type. No Existing Business and no National/Fayda
+ *                    ID — a Distributor has no business or personal compliance
+ *                    data of its own in the IDC model.
+ *   Sub-Distributor  … and the Distributor it belongs to. No Existing Business,
+ *                    no Geographical Domain and no National/Fayda ID — a
+ *                    Sub-Distributor has no territory or business of its own in
+ *                    the IDC model.
+ *   Retailer         … + Existing Business, Geographical Domain, the Sub
+ *                    Distributor it belongs to, plus three optional compliance
+ *                    columns: TIN, Location and National/Fayda ID
  *
  * Uplines are chosen from a **closed list** of already-registered users, never
  * typed in: the registry is the single source of truth for the chain, and the
@@ -31,15 +39,20 @@ const LEVELS = [
   {
     level: 1, key: 'distributor', name: 'Distributor', icon: Building2,
     nameLabel: 'Distributor Name', namePlaceholder: 'e.g., Ebyan Communication',
-    businessLabel: 'Existing Business', geoLabel: 'Distributor Region',
+    // No Existing Business at this level — a Distributor has no business of
+    // its own in the IDC model; the region it trades in is what identifies it.
+    businessLabel: null, geoLabel: 'Distributor Region',
     geoPlaceholder: 'e.g., EER, SR, SSWR',
     blurb: 'Top of the chain. Holds the sub-distributors and retailers below it.',
   },
   {
     level: 2, key: 'sub_distributor', name: 'Sub-Distributor', icon: Layers,
     nameLabel: 'Sub Distributor Name', namePlaceholder: 'e.g., Nuuro Ahmed Mohamed',
-    businessLabel: 'Existing Business', geoLabel: 'Geographical Domain',
-    geoPlaceholder: 'e.g., Hargele, Hawassa',
+    // No Existing Business and no Geographical Domain at this level — a
+    // Sub-Distributor has no territory or business of its own in the IDC
+    // model; the areas its retailers trade in live on the Retailer rows.
+    businessLabel: null, geoLabel: null,
+    geoPlaceholder: '',
     blurb: 'Belongs to one Distributor, and carries the retailers below it.',
   },
   {
@@ -222,17 +235,16 @@ export default function ChannelSingleImport() {
     }
 
     setPhotoUploading(true);
-    const fd = new FormData();
-    fd.append('photo', file);
-    fd.append('tin', currentTin);
-
     try {
-      const res = await channelAPI.uploadPhoto(fd);
+      const photoBase64 = await fileToBase64(file);
+      await channelAPI.uploadPhoto({
+        tin: currentTin,
+        photo_base64: photoBase64,
+        content_type: file.type,
+      });
       toast.success('Manager photo uploaded successfully');
       setPhotoTimestamp(Date.now());
-      if (res.filename) {
-        setForm(prev => ({ ...prev, photo_keywords: `local:${res.filename}` }));
-      }
+      setForm(prev => ({ ...prev, photo_keywords: 'custom upload' }));
     } catch (err) {
       toast.error('Failed to upload photo: ' + (err.message || 'Unknown error'));
     } finally {
@@ -479,19 +491,22 @@ export default function ChannelSingleImport() {
               />
             </div>
 
-            {/* Existing business */}
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">{spec.businessLabel}</label>
-              <input
-                type="text" list="channel-business-options" value={form.business_type}
-                onChange={(e) => handleChange('business_type', e.target.value)}
-                placeholder="e.g., super market, Shopes, Open Market"
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-              />
-              <datalist id="channel-business-options">
-                {BUSINESS_SUGGESTIONS.map((b) => <option key={b} value={b} />)}
-              </datalist>
-            </div>
+            {/* Existing business — Distributor and Sub-Distributor sheets no
+                longer carry it; only the Retailer does. */}
+            {spec.businessLabel && (
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">{spec.businessLabel}</label>
+                <input
+                  type="text" list="channel-business-options" value={form.business_type}
+                  onChange={(e) => handleChange('business_type', e.target.value)}
+                  placeholder="e.g., super market, Shopes, Open Market"
+                  className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                />
+                <datalist id="channel-business-options">
+                  {BUSINESS_SUGGESTIONS.map((b) => <option key={b} value={b} />)}
+                </datalist>
+              </div>
+            )}
 
             {/* Status */}
             <div>
@@ -507,22 +522,25 @@ export default function ChannelSingleImport() {
               </select>
             </div>
 
-            {/* Geography */}
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">{spec.geoLabel}</label>
-              <input
-                type="text" list="channel-geo-options" value={form.geo_domain_raw}
-                onChange={(e) => handleChange('geo_domain_raw', e.target.value)}
-                placeholder={spec.geoPlaceholder}
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-              />
-              <datalist id="channel-geo-options">
-                {geoOptions.map((g) => <option key={g} value={g} />)}
-              </datalist>
-              <p className="text-[11px] text-gray-400 mt-1">
-                {geoOptions.length > 0 ? `${geoOptions.length} areas already in use — start typing to match one` : 'Free text place name'}
-              </p>
-            </div>
+            {/* Geography — hidden on the Sub-Distributor level: a
+                Sub-Distributor has no territory of its own. */}
+            {spec.geoLabel && (
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">{spec.geoLabel}</label>
+                <input
+                  type="text" list="channel-geo-options" value={form.geo_domain_raw}
+                  onChange={(e) => handleChange('geo_domain_raw', e.target.value)}
+                  placeholder={spec.geoPlaceholder}
+                  className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                />
+                <datalist id="channel-geo-options">
+                  {geoOptions.map((g) => <option key={g} value={g} />)}
+                </datalist>
+                <p className="text-[11px] text-gray-400 mt-1">
+                  {geoOptions.length > 0 ? `${geoOptions.length} areas already in use — start typing to match one` : 'Free text place name'}
+                </p>
+              </div>
+            )}
 
             {/* Air time type */}
             <div>
@@ -739,9 +757,9 @@ export default function ChannelSingleImport() {
                       {/* Photo Document Card with visual preview & upload action */}
                       <div className="bg-white p-3.5 rounded-xl border border-emerald-200 sm:col-span-2 lg:col-span-3 flex flex-col sm:flex-row items-start sm:items-center gap-4 shadow-xs">
                         <div className="relative w-20 h-20 rounded-xl overflow-hidden bg-slate-900 border-2 border-emerald-400 shadow-md shrink-0 flex items-center justify-center group">
-                          <img
-                            key={photoTimestamp}
-                            src={`/api/channel/photo/${tinData.tin}?t=${photoTimestamp}`}
+                          <ManagerPhoto
+                            tin={tinData.tin}
+                            bust={photoTimestamp}
                             alt={tinData.trade_name || tinData.tin}
                             className="w-full h-full object-cover"
                           />
@@ -795,7 +813,9 @@ export default function ChannelSingleImport() {
                   </div>
                 )}
 
-                {/* Additional form fields for Retailer National ID and Location */}
+                {/* National ID & Location — Retailer-only compliance fields;
+                    Distributors and Sub-Distributors don't carry them. */}
+                {spec.level === 3 && (
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   <div>
                     <label className="block text-sm font-medium text-gray-700 mb-1">
@@ -825,6 +845,7 @@ export default function ChannelSingleImport() {
                     <p className="text-[11px] text-gray-400 mt-1">Sub-City, Woreda, Kebele, Landmark or House No.</p>
                   </div>
                 </div>
+                )}
               </div>
             </div>
           )}

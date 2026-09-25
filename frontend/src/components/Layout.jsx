@@ -240,7 +240,9 @@ export default function Layout() {
             <NavLink
               key={item.to}
               to={item.to}
-              end={item.to === '/dashboard'}
+              // "/channel" is a prefix of /channel/reports, /channel/import-batch…
+              // Without `end` it would stay highlighted on every channel page.
+              end={item.to === '/dashboard' || item.to === '/channel'}
               className={({ isActive }) =>
                 `relative flex items-center gap-3 px-3 py-2.5 text-sm font-medium rounded-xl transition-all duration-200 ${
                   isActive
