@@ -4,7 +4,7 @@
  *
  * Uses IF NOT EXISTS so it's safe to re-run.
  */
-require('dotenv').config();
+require('../env');
 const mysql = require('mysql2/promise');
 
 async function run() {

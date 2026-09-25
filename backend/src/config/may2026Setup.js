@@ -1,6 +1,6 @@
 const mysql = require('mysql2/promise');
 const XLSX = require('xlsx');
-require('dotenv').config();
+require('../env');
 
 // Service type mapping from sheet names to clean service names
 const SERVICE_MAP = {

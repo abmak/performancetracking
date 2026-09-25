@@ -9,7 +9,7 @@
  *   node src/config/addChannelEditPermissions.js
  */
 const mysql = require('mysql2/promise');
-require('dotenv').config();
+require('../env');
 
 const PERMISSIONS = [
   { name: 'channel_entities.edit',   description: 'Edit registered channel data (dashboard registry and reports)', module: 'channel_entities',   action: 'edit',   section: 'INDIRECT_CHANNEL' },

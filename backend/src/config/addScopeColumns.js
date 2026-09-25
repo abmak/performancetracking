@@ -21,7 +21,7 @@
  *   node src/config/addScopeColumns.js
  */
 const mysql = require('mysql2/promise');
-require('dotenv').config();
+require('../env');
 
 async function ensureColumn(connection, table, column, definition, log) {
   const [rows] = await connection.query(

@@ -7,7 +7,7 @@
  *   node src/config/ensureAdminPermissions.js
  */
 const mysql = require('mysql2/promise');
-require('dotenv').config();
+require('../env');
 
 async function main() {
   const conn = await mysql.createConnection({

@@ -66,7 +66,7 @@ router.get('/', async (req, res) => {
         LEFT JOIN vas_services vs ON rt.service_id = vs.id
         WHERE rt.target_amount > 0
           AND rt.target_start_date IS NOT NULL AND rt.target_end_date IS NOT NULL
-          AND rt.target_start_date != '0000-00-00' AND rt.target_end_date != '0000-00-00'
+          AND rt.target_start_date > '1000-01-01' AND rt.target_end_date > '1000-01-01'
           AND DATE_FORMAT(rt.target_start_date, '%Y-%m') <= DATE_FORMAT(?, '%Y-%m')
           AND DATE_FORMAT(rt.target_end_date, '%Y-%m') >= DATE_FORMAT(?, '%Y-%m')
       `;

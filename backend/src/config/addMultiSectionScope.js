@@ -18,7 +18,7 @@
  *   node src/config/addMultiSectionScope.js
  */
 const mysql = require('mysql2/promise');
-require('dotenv').config();
+require('../env');
 
 const NEW_DEFINITION = "ENUM('GLOBAL','VAS','INDIRECT_CHANNEL','MULTI_SECTION') NOT NULL DEFAULT 'VAS'";
 

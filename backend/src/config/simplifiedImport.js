@@ -1,7 +1,7 @@
 const mysql = require('mysql2/promise');
 const XLSX = require('xlsx');
 const { v4: uuidv4 } = require('uuid');
-require('dotenv').config();
+require('../env');
 
 // For each sheet, define column indices for: [partnerName, totalRevenue, ethioShare, month]
 const SHEET_CONFIG = {

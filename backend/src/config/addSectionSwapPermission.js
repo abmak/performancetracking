@@ -1,5 +1,5 @@
 const mysql = require('mysql2/promise');
-require('dotenv').config();
+require('../env');
 
 async function migrate() {
   const connection = await mysql.createConnection({

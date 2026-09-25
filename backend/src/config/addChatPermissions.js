@@ -5,7 +5,7 @@
  *   node src/config/addChatPermissions.js
  */
 const mysql = require('mysql2/promise');
-require('dotenv').config();
+require('../env');
 
 const PERMISSIONS = [
   // ── VAS Section ──────────────────────────────────────────────────────
