@@ -80,6 +80,18 @@ app.use('/api/notifications', authenticate, notificationRoutes);
 app.use('/api/channel/imports', authenticate, channelImportRoutes);
 app.use('/api/channel', authenticate, channelRoutes);
 
+// Production single-service mode: serve the built frontend when present.
+// The SPA calls the API with relative /api paths, so everything runs on this
+// one port — no separate web server needed.
+const distDir = path.join(__dirname, '../../frontend/dist');
+if (require('fs').existsSync(path.join(distDir, 'index.html'))) {
+  app.use(express.static(distDir));
+  app.get('*', (req, res, next) => {
+    if (req.path.startsWith('/api/')) return next();
+    res.sendFile(path.join(distDir, 'index.html'));
+  });
+}
+
 // Error handling middleware
 app.use((err, req, res, next) => {
   // Body-parser and multer reject bad requests with a 4xx status on the error
