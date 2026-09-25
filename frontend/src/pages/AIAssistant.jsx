@@ -184,7 +184,7 @@ export default function AIAssistant() {
       } else if (data.error === 'quota_exceeded') {
         setMessages(prev => [...prev, { role: 'assistant', content: data.message || '⚠️ Daily AI quota reached.', timestamp: new Date().toISOString() }]);
       } else {
-        setMessages(prev => [...prev, { role: 'assistant', content: `⚠️ Error: ${data.error || 'Failed to get response'}`, timestamp: new Date().toISOString() }]);
+        setMessages(prev => [...prev, { role: 'assistant', content: `⚠️ ${data.message || data.error || 'Failed to get response'}`, timestamp: new Date().toISOString() }]);
       }
     } catch (err) {
       setMessages(prev => [...prev, { role: 'assistant', content: `⚠️ Connection error: ${err.message}`, timestamp: new Date().toISOString() }]);

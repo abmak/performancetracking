@@ -3,6 +3,20 @@ const router = express.Router();
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const pool = require('../config/database');
 
+// Optional egress proxy — the production VPS's international link is
+// intermittent; set AI_PROXY_URL in .env.production to route Gemini traffic
+// through a working proxy (also honours standard HTTPS_PROXY).
+const proxyUrl = process.env.AI_PROXY_URL || process.env.HTTPS_PROXY || process.env.https_proxy;
+if (proxyUrl) {
+  try {
+    const { setGlobalDispatcher, ProxyAgent } = require('undici');
+    setGlobalDispatcher(new ProxyAgent(proxyUrl));
+    console.log('[AI] Routing Gemini traffic through proxy');
+  } catch (e) {
+    console.warn('[AI] Proxy configured but undici unavailable:', e.message);
+  }
+}
+
 // ── API Key Pool (round-robin rotation) ────────────────────────────────────────
 // Keys are loaded from environment variables — never hardcode secrets in source!
 // Set GEMINI_API_KEY_1 through GEMINI_API_KEY_5 in your .env file.
@@ -42,6 +56,34 @@ function getActiveClient() {
 function markKeyRateLimited(keyIndex, retryAfterMs = 60000) {
   keyCooldownUntil[keyIndex] = Date.now() + retryAfterMs;
   console.warn(`[AI] Key #${keyIndex + 1} rate-limited, cooldown ${retryAfterMs}ms`);
+}
+
+// Network errors (the VPS international link is intermittent) — retry a few
+// times per key with backoff before giving the next key a chance.
+const isNetworkErr = (e) =>
+  /fetch failed|ENOTFOUND|ECONNRESET|ETIMEDOUT|EAI_AGAIN|ECONNREFUSED|network|socket/i.test(
+    (e && (e.message || '')) + (e && e.cause ? ' ' + (e.cause.code || e.cause.message || '') : '')
+  );
+
+async function sendMessageWithRetry(chat, message, keyIndex, attempts = 3) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    if (i > 0) {
+      const delay = 1200 * i; // 1.2s, 2.4s
+      console.warn(`[AI] Key #${keyIndex + 1} network retry ${i}/${attempts - 1} in ${delay}ms...`);
+      await new Promise((r) => setTimeout(r, delay));
+    }
+    try {
+      return await chat.sendMessage(message);
+    } catch (err) {
+      lastErr = err;
+      const is429 = err.message?.includes('429') || err.message?.includes('RESOURCE_EXHAUSTED');
+      if (is429) throw err; // hand over to key rotation
+      if (!isNetworkErr(err)) throw err; // genuine API error — don't retry
+      // network error — loop and retry
+    }
+  }
+  throw lastErr;
 }
 
 // ── Ensure DB tables exist ─────────────────────────────────────────────────────
@@ -441,7 +483,7 @@ INSTRUCTIONS:
           },
         });
 
-        const result = await chat.sendMessage(message);
+        const result = await sendMessageWithRetry(chat, message, keyIndex);
         const response = result.response;
         const reply = response.text();
 
@@ -462,6 +504,10 @@ INSTRUCTIONS:
           markKeyRateLimited(keyIndex, 60000); // cooldown 1 min
           continue; // try next key
         }
+        if (isNetworkErr(apiErr)) {
+          console.warn(`[AI] Key #${keyIndex + 1} unreachable after retries, rotating to next key...`);
+          continue; // network flake — give the next key (same endpoint) a chance
+        }
         // Non-rate-limit error — throw immediately
         throw apiErr;
       }
@@ -471,6 +517,18 @@ INSTRUCTIONS:
     throw lastError || new Error('All API keys exhausted');
   } catch (error) {
     console.error('AI chat error:', error);
+    if (isNetworkErr(error)) {
+      return res.status(503).json({
+        error: 'AI assistant error',
+        message: 'The AI service is unreachable from the server right now (network). Please try again in a moment.',
+      });
+    }
+    if (/429|RESOURCE_EXHAUSTED|All API keys/i.test(error.message || '')) {
+      return res.status(429).json({
+        error: 'quota_exceeded',
+        message: 'All AI keys are rate-limited right now. Please try again in a minute.',
+      });
+    }
     res.status(500).json({ error: 'AI assistant error', message: error.message });
   }
 });
