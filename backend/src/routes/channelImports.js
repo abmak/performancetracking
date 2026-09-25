@@ -399,7 +399,7 @@ function parseWorkbook(buffer, lookups) {
 
         if (!domainCode) {
           errors.push({
-            sheet_name: sheetName, row_number: i + 1, severity: 'warning',
+            sheet_name: sheetName, row_num: i + 1, severity: 'warning',
             scope: 'summary',
             reason: `Unrecognised summary domain "${currentDomain}"`, raw_data: r,
           });
@@ -407,7 +407,7 @@ function parseWorkbook(buffer, lookups) {
         }
         if (!level) {
           errors.push({
-            sheet_name: sheetName, row_number: i + 1, severity: 'warning',
+            sheet_name: sheetName, row_num: i + 1, severity: 'warning',
             scope: 'summary',
             reason: `Unrecognised summary category "${rawCat}" — stored without a level mapping`, raw_data: r,
           });
@@ -484,7 +484,7 @@ function parseWorkbook(buffer, lookups) {
 
       const reject = (reason) => {
         errors.push({
-          sheet_name: sheetName, row_number: i + 1, severity: 'reject',
+          sheet_name: sheetName, row_num: i + 1, severity: 'reject',
           reason, raw_data: { name: rawName, mobile: rawMobile, category: rawCategory },
         });
       };
@@ -500,7 +500,7 @@ function parseWorkbook(buffer, lookups) {
       const warn = (reason) => {
         warned = true;
         errors.push({
-          sheet_name: sheetName, row_number: i + 1, severity: 'warning',
+          sheet_name: sheetName, row_num: i + 1, severity: 'warning',
           scope: 'row',
           reason, raw_data: { name: rawName, mobile: rawMobile },
         });
@@ -549,7 +549,7 @@ function dedupeByMobile(rows, errors) {
     best.set(r.mobile, kept);
     duplicates.push(dropped);
     errors.push({
-      sheet_name: dropped.sheet, row_number: dropped.row, severity: 'duplicate',
+      sheet_name: dropped.sheet, row_num: dropped.row, severity: 'duplicate',
       reason: `Duplicate mobile ${r.mobile} in this file — kept the higher balance (${kept.balance})`,
       raw_data: { name: dropped.name, mobile: dropped.mobile, balance: dropped.balance },
     });
@@ -747,7 +747,7 @@ router.post('/preview', upload.single('file'), async (req, res) => {
         const detected = [...new Set(badSheets.map((s) => levelLabel[s.level] || `Level ${s.level}`))];
         errors.push({
           sheet_name: badSheets.map((s) => s.name).join(', '),
-          row_number: null,
+          row_num: null,
           severity: 'reject',
           reason: `The selected level was ${levelLabel[expectedLevel]}, but the columns in these sheet(s) were recognised as ${detected.join(', ')}. Check that you uploaded the right file, or pick the correct level.`,
           raw_data: { expected_level: expectedLevel, detected_levels: badSheets.map((s) => s.level) },
@@ -1118,9 +1118,9 @@ router.get('/:id/errors', async (req, res) => {
     if (severity) { where.push('severity = ?'); params.push(severity); }
 
     const [rows] = await pool.query(
-      `SELECT id, sheet_name, row_number, severity, reason, raw_data
+      `SELECT id, sheet_name, row_num, severity, reason, raw_data
          FROM channel_import_errors WHERE ${where.join(' AND ')}
-        ORDER BY severity = 'reject' DESC, row_number ASC LIMIT ?`,
+        ORDER BY severity = 'reject' DESC, row_num ASC LIMIT ?`,
       [...params, parseInt(limit, 10) || 500]
     );
     const [counts] = await pool.query(
@@ -1551,12 +1551,12 @@ async function storeErrors(batchId, errors) {
   const limited = errors.slice(0, MAX_STORED_ERRORS);
   for (const chunk of chunkArray(limited, CHUNK)) {
     const values = chunk.map((e) => [
-      batchId, (e.sheet_name || '').slice(0, 150), e.row_number || null,
+      batchId, (e.sheet_name || '').slice(0, 150), e.row_num || null,
       e.severity || 'reject', (e.reason || '').slice(0, 255),
       e.raw_data ? JSON.stringify(e.raw_data).slice(0, 2000) : null,
     ]);
     await pool.query(
-      `INSERT INTO channel_import_errors (batch_id, sheet_name, row_number, severity, reason, raw_data)
+      `INSERT INTO channel_import_errors (batch_id, sheet_name, row_num, severity, reason, raw_data)
        VALUES ${values.map(() => '(?,?,?,?,?,?)').join(',')}`,
       values.flat()
     );
@@ -1589,7 +1589,7 @@ async function stageRows(batchId, rows) {
     ]);
     await pool.query(
       `INSERT INTO channel_import_rows
-         (batch_id, sheet_name, row_number, mobile_number, user_name, category_id,
+         (batch_id, sheet_name, row_num, mobile_number, user_name, category_id,
           status, geo_domain_raw, product, parent_mobile, owner_mobile,
           business_type, parent_name, owner_name, owner_region,
           tin, location, national_id, available_balance, has_warning)
@@ -1602,7 +1602,7 @@ async function stageRows(batchId, rows) {
 /** Read a batch's staged rows back in the shape the confirm step expects. */
 async function loadStagedRows(batchId) {
   const [rows] = await pool.query(
-    `SELECT sheet_name, row_number, mobile_number, user_name, category_id, status,
+    `SELECT sheet_name, row_num, mobile_number, user_name, category_id, status,
             geo_domain_raw, product, parent_mobile, owner_mobile, business_type,
             parent_name, owner_name, owner_region, tin, location, national_id,
             available_balance, has_warning
@@ -1611,7 +1611,7 @@ async function loadStagedRows(batchId) {
   );
   return rows.map((r) => ({
     sheet: r.sheet_name,
-    row: r.row_number,
+    row: r.row_num,
     name: r.user_name,
     mobile: r.mobile_number,
     category_id: r.category_id,

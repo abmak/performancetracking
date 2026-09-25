@@ -981,7 +981,7 @@ function ErrorTable({ errors }) {
           {errors.slice(0, 100).map((e, i) => (
             <tr key={i} className="border-b border-gray-50 hover:bg-gray-50">
               <td className="px-3 py-1.5 text-gray-600">{e.sheet_name || '—'}</td>
-              <td className="px-3 py-1.5 text-gray-600">{e.row_number ?? '—'}</td>
+              <td className="px-3 py-1.5 text-gray-600">{e.row_number ?? e.row ?? '—'}</td>
               <td className="px-3 py-1.5 text-gray-600 font-mono">{e.raw_data?.mobile || '—'}</td>
               <td className="px-3 py-1.5 text-gray-800">{e.raw_data?.name || '—'}</td>
               <td className="px-3 py-1.5 text-gray-700">{e.reason}</td>

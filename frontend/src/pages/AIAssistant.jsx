@@ -2,6 +2,18 @@ import { useState, useEffect, useRef } from 'react';
 import { Bot, Send, Sparkles, Lightbulb, TrendingUp, Users, AlertTriangle, BarChart3, Loader2 } from 'lucide-react';
 
 const API_BASE = '/api';
+
+// crypto.randomUUID() only exists in secure contexts (HTTPS/localhost) — on a
+// plain-HTTP IP it is undefined and crashed the whole page. Fallback chain:
+const newUuid = () =>
+  (crypto.randomUUID && crypto.randomUUID()) ||
+  (crypto.getRandomValues
+    ? Array.from(crypto.getRandomValues(new Uint8Array(16)), (b, i) =>
+        (i === 6 ? (b & 0x0f) | 0x40 : i === 8 ? (b & 0x3f) | 0x80 : b)
+          .toString(16)
+          .padStart(2, '0')
+      ).join('').replace(/^(.{8})(.{4})(.{4})(.{4})(.{12})$/, '$1-$2-$3-$4-$5')
+    : `${Date.now()}-${Math.random().toString(16).slice(2)}`);
 const getAuthHeaders = () => {
   const token = localStorage.getItem('vas_token');
   return token ? { Authorization: `Bearer ${token}` } : {};
@@ -39,7 +51,7 @@ export default function AIAssistant() {
     // Resume last session or create new one
     const saved = localStorage.getItem('vas_ai_session');
     if (saved) return saved;
-    const id = crypto.randomUUID();
+    const id = newUuid();
     localStorage.setItem('vas_ai_session', id);
     return id;
   });
@@ -110,7 +122,7 @@ export default function AIAssistant() {
   }
 
   function startNewSession() {
-    const id = crypto.randomUUID();
+    const id = newUuid();
     localStorage.setItem('vas_ai_session', id);
     setSessionId(id);
     setMessages([WELCOME_MSG]);

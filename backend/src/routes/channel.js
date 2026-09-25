@@ -1289,7 +1289,8 @@ router.get('/entities', async (req, res) => {
     }
     if (domain) { where.push('d.code = ?'); params.push(domain); }
     if (category) { where.push('c.code = ?'); params.push(category); }
-    if (level) { where.push('c.level = ?'); params.push(Number(level)); }
+    const lvl = Number(level);
+    if (level !== undefined && level !== '' && Number.isFinite(lvl)) { where.push('c.level = ?'); params.push(lvl); }
     if (status) { where.push('e.status = ?'); params.push(status); }
     if (geo) { where.push('e.geo_domain_raw = ?'); params.push(geo); }
     // "Show me exactly what this import brought in" — the audit view of one run.
